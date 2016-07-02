@@ -31,6 +31,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #endif // BOOST_OS_WINDOWS
 #include <boost/interprocess/containers/string.hpp>
 #include <boost/container/scoped_allocator.hpp>
+#include <boost/interprocess/offset_ptr.hpp>
 #include <cstdint>
 
 namespace bi = boost::interprocess;
@@ -39,28 +40,30 @@ namespace bi = boost::interprocess;
 namespace usvfs {
 namespace shared {
 
+template <typename T>
+using OffsetPtrT = bi::offset_ptr<T, std::int32_t, std::uint64_t>;
+typedef OffsetPtrT<void> VoidPointerT;
 
-typedef bi::offset_ptr<void, std::int32_t, std::uint64_t, 4> VoidPointerT;
 
-
+// important: the windows shared memory mechanism, unlike other impelementations
+// automatically removes the SHM object when there are no more "subscribers".
+// MO currently depends on that feature!
 #ifdef BOOST_OS_WINDOWS
 // managed_windows_shared_memory apparently doesn't support sharing between
 // 64bit and 32bit processes
 typedef bi::basic_managed_windows_shared_memory
    <char
-   , bi::rbtree_best_fit<bi::mutex_family, VoidPointerT>
+   , bi::rbtree_best_fit<bi::mutex_family, VoidPointerT, 8>
    , bi::iset_index>
 managed_windows_shared_memory;
 
 typedef managed_windows_shared_memory SharedMemoryT;
-//typedef boost::interprocess::managed_shared_memory SharedMemoryT;
 #else // BOOST_OS_WINDOWS
-typedef boost::interprocess::managed_shared_memory SharedMemoryT;
+#error "currently only windows supported"
 #endif // BOOST_OS_WINDOWS
 
 typedef SharedMemoryT::segment_manager SegmentManagerT;
 typedef boost::container::scoped_allocator_adaptor<boost::interprocess::allocator<void, SegmentManagerT>> VoidAllocatorT;
-//typedef boost::interprocess::allocator<void, SegmentManagerT> VoidAllocatorT;
 typedef VoidAllocatorT::rebind<char>::other CharAllocatorT;
 
 typedef bi::basic_string<char, std::char_traits<char>, CharAllocatorT> StringT;

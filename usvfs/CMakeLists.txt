@@ -10,6 +10,7 @@ SET(usvfs_HDRS
   hooks/sharedids.h
   loghelpers.h
   redirectiontree.h
+  semaphore.h
   stringcast_boost.h
   usvfs.h
   )
@@ -23,6 +24,7 @@ SET(usvfs_SRCS
   hooks/ole32.cpp
   loghelpers.cpp
   redirectiontree.cpp
+  semaphore.cpp
   stringcast_boost.cpp
   usvfs.cpp
   )
@@ -47,8 +49,6 @@ INCLUDE_DIRECTORIES("${Boost_INCLUDE_DIRS}"
                     "${CPPFORMAT_SOURCE_DIR}"
                     )
 
-MESSAGE(STATUS "linking against libs in ${CMAKE_BINARY_DIR}")
-
 LINK_DIRECTORIES(${LINK_DIRECTORIES}
                  "${Boost_LIBRARY_DIRS}"
                  "${ASMJIT_BINARY_DIR}"
@@ -60,10 +60,10 @@ LINK_DIRECTORIES(${LINK_DIRECTORIES}
 
 ADD_DEFINITIONS(-D_WINDLL -DBOOST_LIB_DIAGNOSTIC -DNOMINMAX)
 
-set(libname usvfs_${PROJ_ARCH})
+SET(libname usvfs_${PROJ_ARCH})
 
 ADD_LIBRARY(${libname} SHARED ${usvfs_HDRS} ${usvfs_SRCS} ${usvfs_RCS})
-TARGET_LINK_LIBRARIES(${libname} asmjit shared libudis86 thooklib tinjectlib Shlwapi usvfs_helper)
+TARGET_LINK_LIBRARIES(${libname} asmjit shared libudis86 thooklib tinjectlib Shlwapi usvfs_helper Version)
 
 IF (MSVC)
     SET_PROPERTY(TARGET ${libname} APPEND_STRING PROPERTY COMPILE_FLAGS "/W4 /wd4503 /GS-")
@@ -71,7 +71,9 @@ ELSE()
     SET_PROPERTY(TARGET ${libname} APPEND_STRING PROPERTY COMPILE_FLAGS "-Wall")
 ENDIF()
 
-
+IF (IWYU_PATH)
+  SET_PROPERTY(TARGET ${libname} PROPERTY CXX_INCLUDE_WHAT_YOU_USE ${IWYU_PATH})
+ENDIF()
 SET_TARGET_PROPERTIES(${libname} PROPERTIES VERSION ${PROJ_VERSION})
 
 ###############

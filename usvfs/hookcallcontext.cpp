@@ -23,6 +23,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include <logging.h>
 #include <bitset>
 #include <thread>
+#include "hookcontext.h"
 
 
 namespace usvfs {
@@ -30,7 +31,7 @@ namespace usvfs {
 class HookStack {
 public:
   static HookStack &instance() {
-    if (!s_Instance.get()) {
+    if (s_Instance.get() == nullptr) {
       s_Instance.reset(new HookStack());
     }
     return *s_Instance.get();
@@ -78,6 +79,7 @@ HookCallContext::HookCallContext(MutExHookGroup group)
   updateLastError();
 }
 
+
 HookCallContext::~HookCallContext()
 {
   if (m_Active && (m_Group != MutExHookGroup::NO_GROUP)) {
@@ -86,10 +88,12 @@ HookCallContext::~HookCallContext()
   SetLastError(m_LastError);
 }
 
-void HookCallContext::updateLastError()
+
+void HookCallContext::updateLastError(DWORD lastError)
 {
-  m_LastError = GetLastError();
+  m_LastError = lastError;
 }
+
 
 bool HookCallContext::active() const
 {

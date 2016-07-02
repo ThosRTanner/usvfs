@@ -20,6 +20,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #include "loghelpers.h"
 #include <stringcast.h>
+#include <stringutils.h>
 
 
 namespace ush = usvfs::shared;
@@ -27,10 +28,20 @@ namespace ush = usvfs::shared;
 
 std::ostream &usvfs::log::operator<<(std::ostream &os, const Wrap<NTSTATUS> &status)
 {
-  if (status.data() == 0x00000000) {
-    os << "ok";
-  } else {
-    os << "err " << std::hex << (int)status.data();
+  switch (status.data()) {
+    case 0x00000000: {
+      os << "ok";
+    } break;
+    case 0xC0000022: {
+      os << "access denied";
+    } break;
+    case 0xC0000035: {
+      os << "exists already";
+    } break;
+    default: {
+      ush::FormatGuard guard(os);
+      os << "err " << std::hex << (int)status.data();
+    } break;
   }
   return os;
 }
@@ -67,6 +78,7 @@ static void writeToStream(std::ostream &os, LPCWSTR str)
   }
 }
 
+
 std::ostream &usvfs::log::operator<<(std::ostream &os, const Wrap<LPWSTR> &str)
 {
   try {
@@ -77,6 +89,7 @@ std::ostream &usvfs::log::operator<<(std::ostream &os, const Wrap<LPWSTR> &str)
 
   return os;
 }
+
 
 std::ostream &usvfs::log::operator<<(std::ostream &os, const Wrap<LPCWSTR> &str)
 {
@@ -102,4 +115,26 @@ std::ostream &usvfs::log::operator<<(std::ostream &os, const Wrap<std::wstring> 
   }
 
   return os;
+}
+
+spdlog::level::level_enum usvfs::log::ConvertLogLevel(LogLevel level)
+{
+  switch (level) {
+    case LogLevel::Debug: return spdlog::level::debug;
+    case LogLevel::Info: return spdlog::level::info;
+    case LogLevel::Warning: return spdlog::level::warn;
+    case LogLevel::Error: return spdlog::level::err;
+    default: return spdlog::level::debug;
+  }
+}
+
+LogLevel usvfs::log::ConvertLogLevel(spdlog::level::level_enum level)
+{
+  switch (level) {
+    case spdlog::level::debug: return LogLevel::Debug;
+    case spdlog::level::info:  return LogLevel::Info;
+    case spdlog::level::warn:  return LogLevel::Warning;
+    case spdlog::level::err:   return LogLevel::Error;
+    default: return LogLevel::Debug;
+  }
 }

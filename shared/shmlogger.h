@@ -22,16 +22,14 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 
 #include "logging.h"
 #include "windows_sane.h"
+#include "shared_memory.h"
 #include <boost/interprocess/ipc/message_queue.hpp>
-#include <boost/interprocess/offset_ptr.hpp>
 #include <boost/format.hpp>
 #include <atomic>
 #include <spdlog.h>
 #include <cstdint>
 
-
-typedef boost::interprocess::offset_ptr<void, std::int32_t, std::uint32_t, 4> offset_ptr_interop;
-typedef boost::interprocess::message_queue_t<offset_ptr_interop> message_queue_interop;
+typedef boost::interprocess::message_queue_t<usvfs::shared::VoidPointerT> message_queue_interop;
 
 namespace spdlog {
 namespace sinks {
@@ -43,32 +41,12 @@ class shm_sink : public sink {
 public:
   shm_sink(const char *queueName);
   virtual void log(const details::log_msg &msg) override;
+  void output(level::level_enum lev, const std::string &message);
   virtual void flush() override;
 };
 }
 }
 
-/*
-class shm_sink_backend
-    : public boost::log::sinks::basic_formatted_sink_backend<
-        char,
-        boost::log::sinks::combine_requirements<
-            boost::log::sinks::synchronized_feeding
-        >::type
-      > {
-public:
-  shm_sink_backend(const char *queueName);
-  void consume(boost::log::record_view const& record, const string_type
-&message);
-
-private:
-
-  message_queue_interop m_LogQueue;
-
-  std::atomic<int> m_DroppedMessages;
-
-};
-*/
 
 class SHMLogger {
 
@@ -80,6 +58,10 @@ public:
   static SHMLogger &create(const char *instanceName);
   static SHMLogger &open(const char *instanceName);
   static void free();
+
+  static bool isInstantiated() {
+    return s_Instance != nullptr;
+  }
 
   static inline SHMLogger &instance() {
     if (s_Instance == nullptr) {

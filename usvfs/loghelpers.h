@@ -29,9 +29,6 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include <ntdll_declarations.h>
 
 
-#define ENABLE_CALLLOG
-
-
 namespace usvfs {
 
 namespace log {
@@ -49,26 +46,24 @@ public:
 
 class CallLogger {
 public:
-  CallLogger(const char *function)
+  explicit CallLogger(const char *function)
   {
-#ifdef ENABLE_CALLLOG
     const char *namespaceend = strrchr(function, ':');
     if (namespaceend != nullptr) {
       function = namespaceend + 1;
     }
     m_Message << function;
-#endif
   }
   ~CallLogger()
   {
-#ifdef ENABLE_CALLLOG
     try {
-      spdlog::get("hooks")->debug("{}", m_Message.str());
+      static std::shared_ptr<spdlog::logger> log = spdlog::get("hooks");
+      log->debug("{}", m_Message.str());
     } catch (...) {
       // suppress all exceptions in destructor
     }
-#endif
   }
+
   template <typename T>
   CallLogger &addParam(const char *name, const T &value, uint8_t style = 0);
 private:
@@ -93,19 +88,20 @@ private:
 template <typename T>
 CallLogger &CallLogger::addParam(const char *name, const T &value, uint8_t style)
 {
+  static bool enabled = spdlog::get("hooks")->should_log(spdlog::level::debug);
   typedef std::underlying_type<DisplayStyle>::type DSType;
-#ifdef ENABLE_CALLLOG
-  m_Message << " [" << name << "=";
-  if (style & static_cast<DSType>(DisplayStyle::Hex)) {
-    m_Message << std::hex;
-  } else {
-    m_Message << std::dec;
+  if (enabled) {
+    m_Message << " [" << name << "=";
+    if (style & static_cast<DSType>(DisplayStyle::Hex)) {
+      m_Message << std::hex;
+    } else {
+      m_Message << std::dec;
+    }
+
+    outputParam(m_Message, value, std::is_pointer<T>());
+
+    m_Message << "]";
   }
-
-  outputParam(m_Message, value, std::is_pointer<T>());
-
-  m_Message << "]";
-#endif
   return *this;
 }
 
@@ -116,10 +112,13 @@ CallLogger &CallLogger::addParam(const char *name, const T &value, uint8_t style
 template <typename T>
 class Wrap {
 public:
-  Wrap(const T &data) : m_Data(data) {}
+  explicit Wrap(const T &data) : m_Data(data) {}
+  Wrap(Wrap<T> &&reference) : m_Data(std::move(reference.m_Data)) {}
+  Wrap(const Wrap<T> &reference) = delete;
+  Wrap<T> &operator=(const Wrap<T>& reference) = delete;
   const T &data() const { return m_Data; }
 private:
-  T m_Data;
+  const T &m_Data;
 };
 
 template <typename T>
@@ -134,9 +133,13 @@ std::ostream &operator<<(std::ostream &os, const Wrap<PUNICODE_STRING> &str);
 std::ostream &operator<<(std::ostream &os, const Wrap<NTSTATUS> &status);
 
 
+spdlog::level::level_enum ConvertLogLevel(LogLevel level);
+LogLevel ConvertLogLevel(spdlog::level::level_enum level);
+
 } // namespace log
 
 } // namespace usvfs
+
 
 // prefer the short variant of the function name, without signature.
 // Fall back to the portable boost macro

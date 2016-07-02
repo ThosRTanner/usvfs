@@ -27,6 +27,10 @@ SET(PROJ_ARCH x86 CACHE STRING "build architecture, has to be x86 or x64")
 
 ADD_DEFINITIONS(-DUNICODE -D_UNICODE -DASMJIT_STATIC -DPROJ_VERSION="${PROJ_VERSION}")
 
+# optimizations to spdlog
+# logger name isn't printed, loggers are created in advance
+ADD_DEFINITIONS(-DSPDLOG_NO_NAME -DSPDLOG_NO_REGISTRY_MUTEX)
+
 #ADD_DEFINITIONS(-DBOOST_EXCEPTION_DISABLE -DBOOST_NO_EXCEPTIONS)
 SET(default_project_path "${CMAKE_SOURCE_DIR}/..")
 GET_FILENAME_COMPONENT(${default_project_path} ${default_project_path} REALPATH)
@@ -34,6 +38,11 @@ GET_FILENAME_COMPONENT(${default_project_path} ${default_project_path} REALPATH)
 SET(project_path "${default_project_path}" CACHE PATH "path to the other mo projects")
 SET(lib_path "${project_path}/../install/libs")
 LINK_DIRECTORIES("${lib_path}")
+
+FIND_PROGRAM(IWYU_PATH NAMES include-what-you-use iwyu PATHS ${project_path}/include-what-you-use/bin)
+IF(IWYU_PATH-NOTFOUND)
+  MESSAGE(STATUS "Could not find the program include-what-you-use")
+ENDIF()
 
 ADD_SUBDIRECTORY(shared)
 ADD_SUBDIRECTORY(shared_test)
@@ -47,4 +56,3 @@ ADD_SUBDIRECTORY(usvfs)
 ADD_SUBDIRECTORY(usvfs_test)
 ADD_SUBDIRECTORY(usvfs_helper)
 ADD_SUBDIRECTORY(usvfs_proxy)
-ADD_SUBDIRECTORY(usvfs_loader)

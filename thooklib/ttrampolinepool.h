@@ -50,6 +50,8 @@ public:
 
   static TrampolinePool &instance();
 
+  void setBlock(bool block);
+
   ///
   /// store a stub without moving code from the original function. This is used in cases
   /// where the hook can be placed without overwriting logic (i.e. hot-patchable functions and
@@ -120,7 +122,14 @@ private:
 
   TrampolinePool &operator=(const TrampolinePool &reference); // not implemented
 
-  void allocateBuffer(LPVOID addressNear);
+  /**
+   * @brief allocates a buffer with read, write and execute rights near the
+   * specified adress. The purpose is that we want to be able to jump from
+   * adressNear to generated code with a 5-byte jump, even on x64 systems.
+   * @param addressNear the reference adress
+   * @note the resulting buffer is stored in the m_Buffers map
+   */
+  BufferMap::iterator allocateBuffer(LPVOID addressNear);
 
   void addBarrier(LPVOID rerouteAddr, LPVOID original, asmjit::X86Assembler &assembler);
 
@@ -164,17 +173,12 @@ private:
 
   static TrampolinePool *s_Instance;
 
+  bool m_FullBlock {false};
+
   BufferMap m_Buffers;
-
-  // TODO: one barrier for each function&thread instead of only per-thread?
-  //typedef std::map<std::pair<DWORD, void*>, void*> TThreadMap;
-
-  //TThreadMap m_ThreadGuards;
 
   typedef std::map<void*, void*> TThreadMap;
   boost::thread_specific_ptr<TThreadMap> m_ThreadGuards;
-
-  std::mutex m_MapMutex;
 
   LPVOID m_BarrierAddr;
   LPVOID m_ReleaseAddr;

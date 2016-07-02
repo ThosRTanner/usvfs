@@ -20,80 +20,19 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
 
-#include "../shared/stringutils.h"
 #include "../shared/logging.h"
-#include <boost/interprocess/containers/string.hpp>
-#include <boost/interprocess/containers/vector.hpp>
-#include <boost/interprocess/containers/set.hpp>
-#include "../shared/shared_memory.h"
+#include "../usvfs/dllimport.h"
 
-namespace usvfs {
 
-struct Parameters {
-  Parameters(const char *instanceName, bool debugMode, LogLevel logLevel)
-    : debugMode(debugMode)
-    , logLevel(logLevel)
-  {
-    strncpy_s(this->instanceName, 64, instanceName, _TRUNCATE);
-    strncpy_s(this->currentSHMName, 64, instanceName, _TRUNCATE);
-  }
+extern "C" {
 
-  Parameters(const char *instanceName, const char *currentSHMName, bool debugMode, LogLevel logLevel)
-    : debugMode(debugMode)
-    , logLevel(logLevel)
-  {
-    strncpy_s(this->instanceName, 64, instanceName, _TRUNCATE);
-    strncpy_s(this->currentSHMName, 64, currentSHMName, _TRUNCATE);
-  }
 
+struct USVFSParameters {
   char instanceName[65];
   char currentSHMName[65];
-  bool debugMode { false };
-  LogLevel logLevel { LogLevel::Debug };
-};
-
-struct SharedParameters {
-
-  SharedParameters() = delete;
-
-  SharedParameters(const SharedParameters &reference) = delete;
-
-  SharedParameters &operator=(const SharedParameters &reference) = delete;
-
-  SharedParameters(const Parameters &reference, const shared::VoidAllocatorT &allocator)
-    : instanceName(reference.instanceName, allocator)
-    , currentSHMName(reference.currentSHMName, allocator)
-    , debugMode(reference.debugMode)
-    , logLevel(reference.logLevel)
-    , userCount(1)
-    , processList(allocator)
-   {
-    /*
-   for (const auto &name : reference.processBlacklist) {
-      processBlacklist.push_back(shared::StringT(name.c_str(), allocator));
-    }
-    */
-  }
-
-  explicit operator Parameters()
-  {
-    Parameters result(instanceName.c_str(), currentSHMName.c_str(), debugMode, logLevel);
-    /*
-    for (const auto &name : processBlacklist) {
-      result.processBlacklist.push_back(name.c_str());
-    }
-    */
-    return result;
-  }
-
-  shared::StringT instanceName;
-  shared::StringT currentSHMName;
-  bool debugMode;
-  LogLevel logLevel;
-  int userCount;
-  boost::container::vector<shared::StringT> processBlacklist;
-  typedef shared::VoidAllocatorT::rebind<DWORD>::other DWORDAllocatorT;
-  boost::container::set<DWORD, std::less<DWORD>, DWORDAllocatorT> processList;
+  char currentInverseSHMName[65];
+  bool debugMode{false};
+  LogLevel logLevel{LogLevel::Debug};
 };
 
 }

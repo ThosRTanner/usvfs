@@ -21,12 +21,15 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "usvfs.h"
 #include "hookmanager.h"
 #include "redirectiontree.h"
+#include "loghelpers.h"
 #include <DbgHelp.h>
 #include <ctime>
 #include <shmlogger.h>
 #include <winapi.h>
 #include <boost/format.hpp>
 #include <boost/tokenizer.hpp>
+#include <boost/locale.hpp>
+#include <boost/algorithm/string.hpp>
 #include <ttrampolinepool.h>
 #include <scopeguard.h>
 #include <stringcast.h>
@@ -35,19 +38,25 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #pragma warning (push, 3)
 #include <boost/filesystem.hpp>
 #pragma warning (pop)
-#include <format.h>
+#include <fmt/format.h>
+#include <codecvt>
 
 
-namespace bfs   = boost::filesystem;
-namespace ush   = usvfs::shared;
-namespace bip   = boost::interprocess;
+namespace bfs = boost::filesystem;
+namespace ush = usvfs::shared;
+namespace bip = boost::interprocess;
+namespace ba  = boost::algorithm;
 
+using usvfs::log::ConvertLogLevel;
 
 usvfs::HookManager *manager = nullptr;
 usvfs::HookContext *context = nullptr;
 HMODULE dllModule = nullptr;
 PVOID exceptionHandler = nullptr;
 
+typedef std::codecvt_utf8_utf16<wchar_t> u8u16_convert;
+
+static std::set<std::string> extensions { ".exe", ".dll" };
 
 namespace spdlog {
   namespace sinks {
@@ -81,7 +90,7 @@ char *SeverityShort(LogLevel lvl)
 void InitLoggingInternal(bool toConsole, bool connectExistingSHM)
 {
   try {
-    if (!toConsole) {
+    if (!toConsole && !SHMLogger::isInstantiated()) {
       if (connectExistingSHM) {
         SHMLogger::open("usvfs");
       } else {
@@ -92,23 +101,36 @@ void InitLoggingInternal(bool toConsole, bool connectExistingSHM)
     // a temporary logger was created in DllMain
     spdlog::drop("usvfs");
     #pragma message("need a customized name for the shm")
-    auto logger = toConsole ? spdlog::create<spdlog::sinks::stdout_sink_mt>("usvfs")
-                            : spdlog::create<spdlog::sinks::shm_sink>("usvfs", "usvfs");
-    logger->set_pattern("%H:%M:%S.%e [%L] %v");
+    auto logger = spdlog::get("usvfs");
+    if (logger.get() == nullptr) {
+      logger = toConsole ? spdlog::create<spdlog::sinks::stdout_sink_mt>("usvfs")
+                         : spdlog::create<spdlog::sinks::shm_sink>("usvfs", "usvfs");
+      logger->set_pattern("%H:%M:%S.%e [%L] %v");
+    }
+    logger->set_level(spdlog::level::debug);
 
-    logger = toConsole ? spdlog::create<spdlog::sinks::stdout_sink_mt>("hooks")
-                       : spdlog::create<spdlog::sinks::shm_sink>("hooks", "usvfs");
-    logger->set_pattern("%H:%M:%S.%e <%P:%t> [%L] %v");
+    spdlog::drop("hooks");
+    logger = spdlog::get("hooks");
+    if (logger.get() == nullptr) {
+      logger = toConsole ? spdlog::create<spdlog::sinks::stdout_sink_mt>("hooks")
+                         : spdlog::create<spdlog::sinks::shm_sink>("hooks", "usvfs");
+      logger->set_pattern("%H:%M:%S.%e <%P:%t> [%L] %v");
+    }
+    logger->set_level(spdlog::level::debug);
   } catch (const std::exception&) {
     // TODO should really report this
     //OutputDebugStringA((boost::format("init exception: %1%\n") % e.what()).str().c_str());
-    spdlog::create<spdlog::sinks::null_sink>("usvfs");
-    spdlog::create<spdlog::sinks::null_sink>("hooks");
+    if (spdlog::get("usvfs").get() == nullptr) {
+      spdlog::create<spdlog::sinks::null_sink>("usvfs");
+    }
+    if (spdlog::get("hooks").get() == nullptr) {
+      spdlog::create<spdlog::sinks::null_sink>("hooks");
+    }
   }
 }
 
 
-void __cdecl InitLogging(bool toConsole)
+void WINAPI InitLogging(bool toConsole)
 {
   InitLoggingInternal(toConsole, false);
 }
@@ -129,6 +151,12 @@ extern "C" DLLEXPORT bool WINAPI GetLogMessages(char *buffer, size_t size,
                e.what());
     return false;
   }
+}
+
+extern "C" DLLEXPORT void WINAPI SetLogLevel(LogLevel level)
+{
+  spdlog::get("usvfs")->set_level(ConvertLogLevel(level));
+  spdlog::get("hooks")->set_level(ConvertLogLevel(level));
 }
 
 //
@@ -152,7 +180,14 @@ void createMiniDump(PEXCEPTION_POINTERS exceptionPtrs)
   if (dbgDLL) {
     FuncMiniDumpWriteDump funcDump = reinterpret_cast<FuncMiniDumpWriteDump>(GetProcAddress(dbgDLL, "MiniDumpWriteDump"));
     if (funcDump) {
-      std::wstring dmpPath = winapi::wide::getModuleFileName(dllModule) + L"_" + std::to_wstring(time(nullptr)) + L".dmp";
+      //std::wstring dmpPath = winapi::wide::getModuleFileName(dllModule) + L"_" + std::to_wstring(time(nullptr)) + L".dmp";
+#if BOOST_ARCH_X86_64
+      std::wstring dmpPath = winapi::wide::getKnownFolderPath(FOLDERID_LocalAppData) + L"\\usvfs\\uvsfs_x64.dmp";
+#else
+      std::wstring dmpPath = winapi::wide::getKnownFolderPath(FOLDERID_LocalAppData) + L"\\usvfs\\uvsfs_x86.dmp";
+#endif
+      std::wstring parent = bfs::path(dmpPath).parent_path().wstring();
+      winapi::ex::wide::createPath(parent.c_str());
       HANDLE dumpFile = winapi::wide::createFile(dmpPath).createAlways().access(GENERIC_WRITE).share(FILE_SHARE_WRITE)();
       if (dumpFile != INVALID_HANDLE_VALUE) {
         _MINIDUMP_EXCEPTION_INFORMATION exceptionInfo;
@@ -184,6 +219,7 @@ void createMiniDump(PEXCEPTION_POINTERS exceptionPtrs)
         logger->error("No crash dump created, dbghelp.dll invalid");
       }
     }
+    FreeLibrary(dbgDLL);
   } else {
     if (logger != nullptr) {
       logger->error("No crash dump created, dbghelp.dll not found");
@@ -212,7 +248,7 @@ LONG WINAPI VEHandler(PEXCEPTION_POINTERS exceptionPtrs)
     return EXCEPTION_CONTINUE_SEARCH;
   }
 
-  auto logger = spdlog::get("usvfs");
+  auto logger = spdlog::get("hooks");
   // ensure that the barrier won't keep future hook functions from running in case the process lives
   ON_BLOCK_EXIT([] () {
     HookLib::TrampolinePool::instance().forceUnlockBarrier();
@@ -236,8 +272,10 @@ LONG WINAPI VEHandler(PEXCEPTION_POINTERS exceptionPtrs)
 //      exceptionHandler = ::AddVectoredExceptionHandler(0, VEHandler);
       return EXCEPTION_CONTINUE_SEARCH;
     } else {
+      // exception in usvfs. damn
       if (logger.get() != nullptr) {
-        logger->warn("windows exception {0:x}", exceptionPtrs->ExceptionRecord->ExceptionCode);
+        logger->critical("windows exception {0:x}",
+                         exceptionPtrs->ExceptionRecord->ExceptionCode);
       }
     }
   } catch (const std::exception &e) {
@@ -255,39 +293,31 @@ LONG WINAPI VEHandler(PEXCEPTION_POINTERS exceptionPtrs)
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
-spdlog::level::level_enum ConvertLogLevel(LogLevel level)
-{
-  switch (level) {
-    case LogLevel::Debug: return spdlog::level::debug;
-    case LogLevel::Info: return spdlog::level::info;
-    case LogLevel::Warning: return spdlog::level::warn;
-    case LogLevel::Error: return spdlog::level::err;
-    default: return spdlog::level::debug;
-  }
-}
-
-
 //
 // Exported functions
 //
 
 void __cdecl InitHooks(LPVOID parameters, size_t)
 {
-  exceptionHandler = ::AddVectoredExceptionHandler(0, VEHandler);
-#pragma message("bug: if the ve handler is called, the process breaks")
-
   InitLoggingInternal(false, true);
 
-  usvfs::Parameters *params = reinterpret_cast<usvfs::Parameters *>(parameters);
-  spdlog::get("usvfs")->set_level(ConvertLogLevel(params->logLevel));
-  spdlog::get("hooks")->set_level(ConvertLogLevel(params->logLevel));
+  if (exceptionHandler == nullptr) {
+    exceptionHandler = ::AddVectoredExceptionHandler(0, VEHandler);
+  } else {
+    spdlog::get("usvfs")->info("vectored exception handler already active");
+    // how did this happen??
+  }
+#pragma message("bug: if the ve handler is called, the process breaks")
+
+  USVFSParameters *params = reinterpret_cast<USVFSParameters *>(parameters);
+  SetLogLevel(params->logLevel);
 
   spdlog::get("usvfs")
       ->debug("inithooks called {0} in process {1} (log level {2})",
               params->instanceName, ::GetCurrentProcessId(),
               static_cast<int>(params->logLevel));
   spdlog::get("usvfs")
-      ->debug("process name: {}", winapi::ansi::getModuleFileName(nullptr));
+      ->info("process name: {}", winapi::ansi::getModuleFileName(nullptr));
 
   try {
     manager = new usvfs::HookManager(*params, dllModule);
@@ -313,7 +343,7 @@ void WINAPI GetCurrentVFSName(char *buffer, size_t size)
 }
 
 
-BOOL WINAPI ConnectVFS(const usvfs::Parameters *params)
+BOOL WINAPI ConnectVFS(const USVFSParameters *params)
 {
   if (spdlog::get("usvfs").get() == nullptr) {
     // create temporary logger so we don't get null-pointer exceptions
@@ -357,14 +387,20 @@ void WINAPI DisconnectVFS()
 
 bool processStillActive(DWORD pid)
 {
-  HANDLE proc = OpenProcess(SYNCHRONIZE, FALSE, pid);
+  HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+
+  if (proc == nullptr) {
+    return false;
+  }
+
   ON_BLOCK_EXIT([proc]() {
     ::CloseHandle(proc);
   });
 
   DWORD exitCode;
   if (!GetExitCodeProcess(proc, &exitCode)) {
-    spdlog::get("usvfs")->warn("failed to query exit code on process {}", pid);
+    spdlog::get("usvfs")->warn("failed to query exit code on process {}: {}",
+                               pid, ::GetLastError());
     return false;
   } else {
     return exitCode == STILL_ACTIVE;
@@ -372,7 +408,7 @@ bool processStillActive(DWORD pid)
 }
 
 
-BOOL WINAPI GetVFSProcessList(size_t *count, PDWORD processIDs)
+BOOL WINAPI GetVFSProcessList(size_t *count, LPDWORD processIDs)
 {
   if (count == nullptr) {
     SetLastError(ERROR_INVALID_PARAMETER);
@@ -400,36 +436,42 @@ BOOL WINAPI GetVFSProcessList(size_t *count, PDWORD processIDs)
 
 void WINAPI ClearVirtualMappings()
 {
-    context->redirectionTable()->clear();
+  context->redirectionTable()->clear();
+  context->inverseTable()->clear();
 }
 
-/// ensure the specified path exists. If a physical path of the same name exists, it is inserted into the virtual
-/// directory as an empty reference. If the path doesn't exist virtually and can't be cloned from a physical directory,
-/// this returns false
-/// \todo if this fails (i.e. not all intermediate directories exists) any intermediate directories already created aren't removed
-bool assertPathExists(LPCWSTR path)
+/// ensure the specified path exists. If a physical path of the same name
+/// exists, it is inserted into the virtual directory as an empty reference. If
+/// the path doesn't exist virtually and can't be cloned from a physical
+/// directory, this returns false
+/// \todo if this fails (i.e. not all intermediate directories exists) any
+/// intermediate directories already created aren't removed
+bool assertPathExists(usvfs::RedirectionTreeContainer &table, LPCWSTR path)
 {
   bfs::path p(path);
   p = p.parent_path();
 
-  usvfs::RedirectionTree::NodeT *current = context->redirectionTable().get();
+  usvfs::RedirectionTree::NodeT *current = table.get();
 
-  for (auto iter = p.begin(); iter != p.end(); iter = ush::nextIter(iter, p.end())) {
+  for (auto iter = p.begin(); iter != p.end();
+       iter = ush::nextIter(iter, p.end())) {
     if (current->exists(iter->string().c_str())) {
       // subdirectory exists virtually, all good
-      usvfs::RedirectionTree::NodePtrT found = current->node(iter->string().c_str());
+      usvfs::RedirectionTree::NodePtrT found
+          = current->node(iter->string().c_str());
       current = found.get().get();
     } else {
-      // targetPath is relative to the last rerouted "real" path. This means that if
-      // virtual c:/foo maps to real c:/windows then creating virtual c:/foo/bar will map
-      // to real c:/windows/bar
-      bfs::path targetPath = current->data().linkTarget.size() > 0 ? bfs::path(current->data().linkTarget.c_str()) / *iter
-                                                                   : *iter / "\\";
+      // targetPath is relative to the last rerouted "real" path. This means
+      // that if virtual c:/foo maps to real c:/windows then creating virtual
+      // c:/foo/bar will map to real c:/windows/bar
+      bfs::path targetPath
+          = current->data().linkTarget.size() > 0
+                ? bfs::path(current->data().linkTarget.c_str()) / *iter
+                : *iter / "\\";
       if (is_directory(targetPath)) {
-        usvfs::RedirectionTree::NodePtrT newNode = context->redirectionTable().addDirectory(current->path() / *iter
-                                                                , targetPath.string().c_str()
-                                                                , ush::FLAG_DUMMY
-                                                                , false);
+        usvfs::RedirectionTree::NodePtrT newNode = table.addDirectory(
+            current->path() / *iter, targetPath.string().c_str(),
+            ush::FLAG_DUMMY, false);
         current = newNode.get().get();
       } else {
         spdlog::get("usvfs")->info("{} doesn't exist", targetPath);
@@ -441,26 +483,37 @@ bool assertPathExists(LPCWSTR path)
   return true;
 }
 
-BOOL WINAPI VirtualLinkFile(LPCWSTR source, LPCWSTR destination, unsigned int flags)
+BOOL WINAPI VirtualLinkFile(LPCWSTR source, LPCWSTR destination,
+                            unsigned int flags)
 {
-  // TODO difference between winapi and ntdll api regarding system32 vs syswow64 (and other windows links?)
+  // TODO difference between winapi and ntdll api regarding system32 vs syswow64
+  // (and other windows links?)
   try {
-    if (!assertPathExists(destination)) {
+    if (!assertPathExists(context->redirectionTable(), destination)) {
       SetLastError(ERROR_PATH_NOT_FOUND);
       return FALSE;
     }
 
-    // TODO could save memory here by storing only the file name for the source and constructing
-    // the full name using the parent directory
+    std::string sourceU8
+        = ush::string_cast<std::string>(source, ush::CodePage::UTF8);
     auto res = context->redirectionTable().addFile(
-          destination
-          , usvfs::RedirectionDataLocal(ush::string_cast<std::string>(source))
-          , !(flags & LINKFLAG_FAILIFEXISTS));
+        bfs::path(destination), usvfs::RedirectionDataLocal(sourceU8),
+        !(flags & LINKFLAG_FAILIFEXISTS));
+
+    std::string fileExt = ba::to_lower_copy(bfs::extension(sourceU8));
+    if (extensions.find(fileExt) != extensions.end()) {
+      std::string destinationU8
+          = ush::string_cast<std::string>(destination, ush::CodePage::UTF8);
+
+      context->inverseTable().addFile(
+          bfs::path(source), usvfs::RedirectionDataLocal(destinationU8), true);
+    }
 
     context->updateParameters();
 
     if (res.get() == nullptr) {
-      // the tree structure currently doesn't provide useful error codes but this is currently the only reason
+      // the tree structure currently doesn't provide useful error codes but
+      // this is currently the only reason
       // we would return a nullptr.
       SetLastError(ERROR_FILE_EXISTS);
       return FALSE;
@@ -498,41 +551,52 @@ BOOL WINAPI VirtualLinkDirectoryStatic(LPCWSTR source, LPCWSTR destination, unsi
       return FALSE;
     }
 
-    if (!assertPathExists(destination)) {
+    if (!assertPathExists(context->redirectionTable(), destination)) {
       SetLastError(ERROR_PATH_NOT_FOUND);
       return FALSE;
     }
 
-    std::string sourceU8 = ush::string_cast<std::string>(source, ush::CodePage::UTF8) + "\\";
+    std::string sourceU8
+        = ush::string_cast<std::string>(source, ush::CodePage::UTF8) + "\\";
 
     context->redirectionTable().addDirectory(
-          destination
-          , usvfs::RedirectionDataLocal(sourceU8)
-          , usvfs::shared::FLAG_DIRECTORY | convertRedirectionFlags(flags)
-          , true);
+          destination, usvfs::RedirectionDataLocal(sourceU8),
+          usvfs::shared::FLAG_DIRECTORY | convertRedirectionFlags(flags),
+          (flags & LINKFLAG_CREATETARGET) != 0);
 
-    if (flags & LINKFLAG_RECURSIVE) {
-      std::wstring sourceW = std::wstring(source) + L"\\";
+    if ((flags & LINKFLAG_RECURSIVE) != 0) {
+      std::wstring sourceW      = std::wstring(source) + L"\\";
       std::wstring destinationW = std::wstring(destination) + L"\\";
 
-      for (winapi::ex::wide::FileResult file : winapi::ex::wide::quickFindFiles(source, L"*")) {
+      for (winapi::ex::wide::FileResult file :
+           winapi::ex::wide::quickFindFiles(source, L"*")) {
         if (file.attributes & FILE_ATTRIBUTE_DIRECTORY) {
-          if ((file.fileName != L".")
-              && (file.fileName != L"..")) {
-            VirtualLinkDirectoryStatic(
-                  (sourceW + file.fileName).c_str()
-                  , (destinationW + file.fileName).c_str()
-                  , LINKFLAG_CREATETARGET);
+          if ((file.fileName != L".") && (file.fileName != L"..")) {
+            VirtualLinkDirectoryStatic((sourceW + file.fileName).c_str(),
+                                       (destinationW + file.fileName).c_str(),
+                                       flags);
           }
         } else {
-          std::string nameU8 =
-              ush::string_cast<std::string>(file.fileName.c_str(), ush::CodePage::UTF8);
+          std::string nameU8 = ush::string_cast<std::string>(
+              file.fileName.c_str(), ush::CodePage::UTF8);
 
-          // TODO could save memory here by storing only the file name for the source and constructing
-          // the full name using the parent directory
-          context->redirectionTable().addFile(bfs::path(destination) / nameU8
-                                              , usvfs::RedirectionDataLocal(sourceU8 + nameU8)
-                                              , true);
+          // TODO could save memory here by storing only the file name for the
+          // source and constructing the full name using the parent directory
+          context->redirectionTable().addFile(
+              bfs::path(destination) / nameU8,
+              usvfs::RedirectionDataLocal(sourceU8 + nameU8), true);
+
+          std::string fileExt = ba::to_lower_copy(bfs::extension(nameU8));
+
+          if (extensions.find(fileExt) != extensions.end()) {
+            std::string destinationU8 = ush::string_cast<std::string>(
+                                            destination, ush::CodePage::UTF8)
+                                        + "\\";
+
+            context->inverseTable().addFile(
+                bfs::path(source) / nameU8,
+                usvfs::RedirectionDataLocal(destinationU8 + nameU8), true);
+          }
         }
       }
     }
@@ -564,10 +628,10 @@ BOOL WINAPI CreateProcessHooked(LPCWSTR lpApplicationName
   DWORD flags = dwCreationFlags | CREATE_SUSPENDED;
 
   BOOL res = CreateProcessW(lpApplicationName, lpCommandLine
-                              , lpProcessAttributes, lpThreadAttributes
-                              , bInheritHandles, flags
-                              , lpEnvironment, lpCurrentDirectory
-                              , lpStartupInfo, lpProcessInformation);
+                            , lpProcessAttributes, lpThreadAttributes
+                            , bInheritHandles, flags
+                            , lpEnvironment, lpCurrentDirectory
+                            , lpStartupInfo, lpProcessInformation);
   if (!res) {
     spdlog::get("usvfs")->error("failed to spawn {}", ush::string_cast<std::string>(lpCommandLine));
     return FALSE;
@@ -576,9 +640,8 @@ BOOL WINAPI CreateProcessHooked(LPCWSTR lpApplicationName
   std::wstring applicationDirPath = winapi::wide::getModuleFileName(dllModule);
   boost::filesystem::path p(applicationDirPath);
   try {
-    injectProcess(p.parent_path().wstring()
-                  , context->callParameters()
-                  , *lpProcessInformation);
+    usvfs::injectProcess(p.parent_path().wstring(), context->callParameters(),
+                         *lpProcessInformation);
   } catch (const std::exception &e) {
     spdlog::get("usvfs")->error("failed to inject: {}", e.what());
     logExtInfo(e, LogLevel::Error);
@@ -610,6 +673,51 @@ BOOL WINAPI CreateVFSDump(LPSTR buffer, size_t *size)
 }
 
 
+VOID WINAPI BlacklistExecutable(LPWSTR executableName)
+{
+  context->blacklistExecutable(executableName);
+}
+
+
+VOID WINAPI PrintDebugInfo()
+{
+  spdlog::get("usvfs")
+      ->warn("===== debug {} =====", context->redirectionTable().shmName());
+  void *buffer = nullptr;
+  size_t bufferSize = 0;
+  context->redirectionTable().getBuffer(buffer, bufferSize);
+  std::ostringstream temp;
+  for (size_t i = 0; i < bufferSize; ++i) {
+    temp << std::hex << std::setfill('0') << std::setw(2) << (unsigned)reinterpret_cast<char*>(buffer)[i] << " ";
+    if ((i % 16) == 15) {
+      spdlog::get("usvfs")->info("{}", temp.str());
+      temp.str("");
+      temp.clear();
+    }
+  }
+  if (!temp.str().empty()) {
+    spdlog::get("usvfs")->info("{}", temp.str());
+  }
+  spdlog::get("usvfs")
+      ->warn("===== / debug {} =====", context->redirectionTable().shmName());
+}
+
+
+void WINAPI USVFSInitParameters(USVFSParameters *parameters,
+                                const char *instanceName, bool debugMode,
+                                LogLevel logLevel)
+{
+  parameters->debugMode = debugMode;
+  parameters->logLevel = logLevel;
+  strncpy_s(parameters->instanceName, 64, instanceName, _TRUNCATE);
+  // we can't use the whole buffer as we need a few bytes to store a running
+  // counter
+  strncpy_s(parameters->currentSHMName, 60, instanceName, _TRUNCATE);
+  memset(parameters->currentInverseSHMName, '\0', 65);
+  _snprintf(parameters->currentInverseSHMName, 60, "inv_%s", instanceName);
+}
+
+
 //
 // DllMain
 //
@@ -623,7 +731,6 @@ BOOL APIENTRY DllMain(HMODULE module,
       dllModule = module;
     } break;
     case DLL_PROCESS_DETACH: {
-        DisconnectVFS();
     } break;
     case DLL_THREAD_ATTACH: {
     } break;

@@ -38,8 +38,11 @@ using namespace usvfs::shared;
 namespace HookLib {
 
 
+TrampolinePool *TrampolinePool::s_Instance = nullptr;
+
+
 TrampolinePool::TrampolinePool()
-  : m_MaxTrampolineSize(0)
+  : m_MaxTrampolineSize(sizeof(LPVOID))
 {
   m_BarrierAddr = &TrampolinePool::barrier;
   m_ReleaseAddr = &TrampolinePool::release;
@@ -65,6 +68,13 @@ TrampolinePool &TrampolinePool::instance()
 {
   static TrampolinePool sInstance;
   return sInstance;
+}
+
+void TrampolinePool::setBlock(bool block) {
+  m_FullBlock = block;
+  if (m_ThreadGuards.get() == nullptr) {
+    m_ThreadGuards.reset(new TThreadMap());
+  }
 }
 
 #if BOOST_ARCH_X86_64
@@ -191,8 +201,7 @@ TrampolinePool::BufferList &TrampolinePool::getBufferList(LPVOID address)
   if (iter == m_Buffers.end()) {
     BufferList newBufList = { 0, std::vector<LPVOID>() };
     m_Buffers[rounded] = newBufList;
-    allocateBuffer(address);
-    iter = m_Buffers.find(rounded);
+    iter = allocateBuffer(address);
   }
   return iter->second;
 }
@@ -210,6 +219,7 @@ LPVOID TrampolinePool::storeStub(LPVOID reroute, LPVOID original, LPVOID returnA
 
   // ??? write address of reroute to trampoline and move past the address
   *reinterpret_cast<LPVOID*>(spot) = reroute;
+  // coverity[suspicious_sizeof]
   spot = AddrAdd(spot, sizeof(LPVOID));
   bufferList.offset += sizeof(LPVOID);
 
@@ -223,6 +233,9 @@ LPVOID TrampolinePool::storeStub(LPVOID reroute, LPVOID original, LPVOID returnA
   addAbsoluteJump(assembler, reinterpret_cast<uint64_t>(returnAddress));
 
   size_t codeSize = assembler.getCodeSize();
+
+  m_MaxTrampolineSize = std::max(m_MaxTrampolineSize,
+                                 static_cast<int>(codeSize + sizeof(LPVOID)));
 
   // final test to see if we can store the trampoline in the buffer
   if ((bufferList.offset + codeSize) > m_BufferSize) {
@@ -254,7 +267,8 @@ LPVOID TrampolinePool::storeTrampoline(LPVOID reroute, LPVOID original, LPVOID r
 
   LPVOID spot = AddrAdd(*bufferList.buffers.rbegin(), bufferList.offset);
 
-  *reinterpret_cast<void**>(spot) = reroute;
+  *reinterpret_cast<LPVOID*>(spot) = reroute;
+  // coverity[suspicious_sizeof]
   spot = AddrAdd(spot, sizeof(LPVOID));
   bufferList.offset += sizeof(LPVOID);
 
@@ -269,6 +283,9 @@ LPVOID TrampolinePool::storeTrampoline(LPVOID reroute, LPVOID original, LPVOID r
   assembler.jmp(eax);
 #endif
   size_t codeSize = assembler.getCodeSize();
+
+  m_MaxTrampolineSize = std::max(m_MaxTrampolineSize,
+                                 static_cast<int>(codeSize + sizeof(LPVOID)));
 
   // final test to see if we can store the trampoline in the buffer
   if ((bufferList.offset + codeSize) > m_BufferSize) {
@@ -362,7 +379,8 @@ LPVOID TrampolinePool::storeStub(LPVOID reroute, LPVOID original, size_t preambl
 
   LPVOID spot = AddrAdd(*bufferList.buffers.rbegin(), bufferList.offset);
 
-  *reinterpret_cast<void**>(spot) = reroute;
+  *reinterpret_cast<LPVOID*>(spot) = reroute;
+  // coverity[suspicious_sizeof]
   spot = AddrAdd(spot, sizeof(LPVOID));
   bufferList.offset += sizeof(LPVOID);
 
@@ -380,6 +398,9 @@ LPVOID TrampolinePool::storeStub(LPVOID reroute, LPVOID original, size_t preambl
 
   // adjust relative jumps for move to buffer
   size_t codeSize = assembler.getCodeSize();
+
+  m_MaxTrampolineSize = std::max(m_MaxTrampolineSize,
+                                 static_cast<int>(codeSize + sizeof(LPVOID)));
 
   // final test to see if we can store the trampoline in the buffer
   if ((bufferList.offset + codeSize) > m_BufferSize) {
@@ -407,7 +428,8 @@ LPVOID TrampolinePool::storeTrampoline(LPVOID reroute, LPVOID original, size_t p
 
   LPVOID spot = AddrAdd(*bufferList.buffers.rbegin(), bufferList.offset);
 
-  *reinterpret_cast<void**>(spot) = reroute;
+  *reinterpret_cast<LPVOID*>(spot) = reroute;
+  // coverity[suspicious_sizeof]
   spot = AddrAdd(spot, sizeof(LPVOID));
   bufferList.offset += sizeof(LPVOID);
 
@@ -421,6 +443,10 @@ LPVOID TrampolinePool::storeTrampoline(LPVOID reroute, LPVOID original, size_t p
 
   // adjust relative jumps for move to buffer
   size_t codeSize = assembler.getCodeSize();
+
+  m_MaxTrampolineSize = std::max(m_MaxTrampolineSize,
+                                 static_cast<int>(codeSize + sizeof(LPVOID)));
+
   // TODO this does not take into account that the code size may technically change after relocation
   // in which case the following test may determine the code fits into the buffer when it really
   // doesnt't. asmjit doesn't seem to provide a way to adjust jumps without actually moving the code though
@@ -466,34 +492,33 @@ void TrampolinePool::forceUnlockBarrier()
   } // else no barriers to unlock
 }
 
-
-void TrampolinePool::allocateBuffer(LPVOID addressNear)
+TrampolinePool::BufferMap::iterator TrampolinePool::allocateBuffer(LPVOID addressNear)
 {
   // allocate a buffer that we can write to and that is executable
   SYSTEM_INFO sysInfo;
   ::ZeroMemory(&sysInfo, sizeof(SYSTEM_INFO));
   GetSystemInfo(&sysInfo);
 
-  LPVOID rounded = roundAddress(addressNear);
-  auto iter = m_Buffers.find(rounded);
+  LPVOID rounded     = roundAddress(addressNear);
+  auto iter          = m_Buffers.find(rounded);
   uintptr_t lowerEnd = reinterpret_cast<uintptr_t>(rounded);
   if (iter->second.buffers.size() > 0) {
     // start searching were we last found a buffer
-    lowerEnd = reinterpret_cast<uintptr_t>(*iter->second.buffers.rbegin()) + sysInfo.dwPageSize;
+    lowerEnd = reinterpret_cast<uintptr_t>(*iter->second.buffers.rbegin())
+               + sysInfo.dwPageSize;
   }
 
-  uintptr_t start = std::max(lowerEnd,
-                             reinterpret_cast<uintptr_t>(sysInfo.lpMinimumApplicationAddress));
+  uintptr_t start = std::max(
+      lowerEnd,
+      reinterpret_cast<uintptr_t>(sysInfo.lpMinimumApplicationAddress));
   uintptr_t upperEnd = reinterpret_cast<uintptr_t>(rounded) + m_SearchRange;
-  uintptr_t end   = std::min(upperEnd,
-                             reinterpret_cast<uintptr_t>(sysInfo.lpMaximumApplicationAddress));
+  uintptr_t end = std::min(upperEnd, reinterpret_cast<uintptr_t>(
+                                         sysInfo.lpMaximumApplicationAddress));
 
   LPVOID buffer = nullptr;
   for (uintptr_t cur = start; cur < end; cur += sysInfo.dwPageSize) {
-    buffer = VirtualAlloc(reinterpret_cast<LPVOID>(cur),
-                            m_BufferSize,
-                            MEM_COMMIT | MEM_RESERVE,
-                            PAGE_EXECUTE_READWRITE);
+    buffer = VirtualAlloc(reinterpret_cast<LPVOID>(cur), m_BufferSize,
+                          MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (buffer != nullptr) {
       break;
     }
@@ -508,10 +533,13 @@ void TrampolinePool::allocateBuffer(LPVOID addressNear)
 
   iter->second.offset = 0;
   iter->second.buffers.push_back(buffer);
-  spdlog::get("usvfs")->debug("allocated trampoline buffer for jumps between {0:x} and {1:x} at {2:x}",
-    reinterpret_cast<unsigned long>(rounded),
-    (reinterpret_cast<unsigned long>(rounded) + m_SearchRange),
-    reinterpret_cast<unsigned long>(buffer));
+  spdlog::get("usvfs")->debug(
+      "allocated trampoline buffer for jumps between {0:p} and {1:x} at {2:p}"
+        "(size {3})",
+      rounded,
+      (reinterpret_cast<uintptr_t>(rounded) + m_SearchRange),
+      buffer, m_BufferSize);
+  return iter;
 }
 
 LPVOID TrampolinePool::barrier(LPVOID function)
@@ -526,6 +554,10 @@ LPVOID TrampolinePool::release(LPVOID function)
 
 LPVOID TrampolinePool::barrierInt(LPVOID func)
 {
+  if (m_FullBlock) {
+    return nullptr;
+  }
+
   if (m_ThreadGuards.get() == nullptr) {
     m_ThreadGuards.reset(new TThreadMap());
   }
@@ -541,6 +573,7 @@ LPVOID TrampolinePool::barrierInt(LPVOID func)
 
 LPVOID TrampolinePool::releaseInt(LPVOID func)
 {
+  DWORD lastError = GetLastError();
   if (m_ThreadGuards.get() == nullptr) {
     m_ThreadGuards.reset(new TThreadMap());
   }
@@ -548,13 +581,14 @@ LPVOID TrampolinePool::releaseInt(LPVOID func)
   auto iter = m_ThreadGuards->find(func);
   if (iter == m_ThreadGuards->end()) {
     spdlog::get("hooks")->error("failed to release barrier for func {}", func);
+    ::SetLastError(lastError);
     return nullptr;
   }
 
   LPVOID res = (*m_ThreadGuards)[func];
   (*m_ThreadGuards)[func] = nullptr;
 
-
+  ::SetLastError(lastError);
   return res;
 }
 

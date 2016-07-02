@@ -7,6 +7,7 @@
 #pragma warning(push, 3)
 #include <boost/scoped_array.hpp>
 #include <boost/algorithm/string.hpp>
+#include <boost/locale.hpp>
 //#include <boost/thread/mutex.hpp>
 #pragma warning(pop)
 #include <string>
@@ -25,6 +26,7 @@
 #include <addrtools.h>
 #include <unicodestring.h>
 #include <windows.h>
+#include <fileapi.h>
 
 #pragma warning(disable : 4996)
 
@@ -42,7 +44,10 @@ using usvfs::UnicodeString;
 #define FILE_OVERWRITE_IF 0x00000005
 #define FILE_MAXIMUM_DISPOSITION 0x00000005
 
-UnicodeString CreateUnicodeString(POBJECT_ATTRIBUTES objectAttributes)
+template <typename T>
+using unique_ptr_deleter = std::unique_ptr<T, void (*)(T *)>;
+
+UnicodeString CreateUnicodeString(const OBJECT_ATTRIBUTES *objectAttributes)
 {
   UnicodeString result;
   if (objectAttributes->RootDirectory != nullptr) {
@@ -83,26 +88,32 @@ std::ostream &operator<<(std::ostream &os, POBJECT_ATTRIBUTES attr)
 
 std::pair<UnicodeString, bool>
 applyReroute(const usvfs::HookContext::ConstPtr &context,
+             const usvfs::HookCallContext &callContext,
              const UnicodeString &inPath)
 {
   std::pair<UnicodeString, bool> result;
   result.first  = inPath;
   result.second = false;
 
-  // see if the file exists in the redirection tree
-  std::string lookupPath = ush::string_cast<std::string>(
-      static_cast<LPCWSTR>(result.first) + 4, ush::CodePage::UTF8);
-  auto node = context->redirectionTable()->findNode(lookupPath.c_str());
-  // if so, replace the file name with the path to the mapped file
-  if ((node.get() != nullptr) && !node->data().linkTarget.empty()) {
-    std::wstring reroutePath = ush::string_cast<std::wstring>(
-        node->data().linkTarget.c_str(), ush::CodePage::UTF8);
-    if ((*reroutePath.rbegin() == L'\\') && (*lookupPath.rbegin() != '\\')) {
-      reroutePath.resize(reroutePath.size() - 1);
+  if (callContext.active()) {
+    // see if the file exists in the redirection tree
+    std::string lookupPath = ush::string_cast<std::string>(
+        static_cast<LPCWSTR>(result.first) + 4, ush::CodePage::UTF8);
+spdlog::get("usvfs")->info("find node {}", lookupPath);
+    auto node = context->redirectionTable()->findNode(lookupPath.c_str());
+    // if so, replace the file name with the path to the mapped file
+    if ((node.get() != nullptr) && !node->data().linkTarget.empty()) {
+      std::wstring reroutePath = ush::string_cast<std::wstring>(
+          node->data().linkTarget.c_str(), ush::CodePage::UTF8);
+      if ((*reroutePath.rbegin() == L'\\') && (*lookupPath.rbegin() != '\\')) {
+        reroutePath.resize(reroutePath.size() - 1);
+      }
+      std::replace(reroutePath.begin(), reroutePath.end(), L'/', L'\\');
+      if (reroutePath[1] == L'\\')
+        reroutePath[1] = L'?';
+      result.first.set(reroutePath.c_str());
+      result.second = true;
     }
-    std::replace(reroutePath.begin(), reroutePath.end(), L'/', L'\\');
-    result.first.set(reroutePath.c_str());
-    result.second = true;
   }
   return result;
 }
@@ -132,16 +143,14 @@ findCreateTarget(const usvfs::HookContext::ConstPtr &context,
       [&](const usvfs::RedirectionTree::NodePtrT &node) { visitor(node); };
   context->redirectionTable()->visitPath(lookupPath, visitorWrapper);
   if (visitor.target.get() != nullptr) {
-spdlog::get("usvfs")->info("{} - {}", visitor.target->path().string(), lookupPath);
-    bfs::path relativePath = ush::make_relative(visitor.target->path()
-                                                , bfs::path(lookupPath));
+    bfs::path relativePath
+        = ush::make_relative(visitor.target->path(), bfs::path(lookupPath));
 
-spdlog::get("usvfs")->info("- {}", relativePath.string());
+    bfs::path target(visitor.target->data().linkTarget.c_str());
+    target /= relativePath;
 
-//    result.second = UnicodeString(visitor.target->path().wstring().c_str());
-    result.second = UnicodeString((bfs::path(visitor.target->data().linkTarget.c_str())
-                                   / relativePath).wstring().c_str());
-spdlog::get("usvfs")->info("+ {}", ush::string_cast<std::string>(static_cast<LPCWSTR>(result.second)));
+    result.second = UnicodeString(target.wstring().c_str());
+    winapi::ex::wide::createPath(target.parent_path().wstring().c_str());
   }
   return result;
 }
@@ -149,9 +158,10 @@ spdlog::get("usvfs")->info("+ {}", ush::string_cast<std::string>(static_cast<LPC
 
 std::pair<UnicodeString, bool>
 applyReroute(const usvfs::HookContext::ConstPtr &context,
+             const usvfs::HookCallContext &callContext,
              POBJECT_ATTRIBUTES inAttributes)
 {
-  return applyReroute(context, CreateUnicodeString(inAttributes));
+  return applyReroute(context, callContext, CreateUnicodeString(inAttributes));
 }
 
 ULONG StructMinSize(FILE_INFORMATION_CLASS infoClass)
@@ -271,32 +281,8 @@ void SetInfoFilenameImplSN(T *info, const std::wstring &fileName)
          info->FileNameLength); // doesn't need to be 0-terminated
 
   if (info->ShortNameLength > 0) {
-    // also set shortname
-    if (fileName.length() < 12) {
-      info->ShortNameLength = static_cast<CCHAR>(fileName.length());
-      wcsncpy(info->ShortName, fileName.c_str(),
-              fileName.length()); // doesn't need to be 0-terminated
-    } else {
-      // shortname generation: last dot indicates the extension, which is
-      // maintained
-      // filename is shortened to 6 letters plus ~1
-      // TODO this should be ~x where x incremenents for each file with the
-      // (otherwise) same shortname
-      const wchar_t *fileNameEnd = info->FileName + fileName.length();
-      const wchar_t *ext         = wcsrevsearch(fileNameEnd, info->FileName, L'.');
-
-      info->ShortNameLength = 8 * sizeof(WCHAR);
-      wcsncpy(info->ShortName, info->FileName, 6);
-      wcsncpy(info->ShortName + 6, L"~1", 2);
-      if (ext != nullptr) {
-        size_t extLen = fileNameEnd - ext;
-        info->ShortNameLength += static_cast<CCHAR>(extLen * sizeof(WCHAR));
-        wcsncpy(info->ShortName + 8, ext, extLen);
-      }
-    }
-  }
-  for (size_t i = 0; i < info->ShortNameLength / sizeof(WCHAR); ++i) {
-    info->ShortName[i] = std::towupper(info->ShortName[i]);
+    info->ShortNameLength = static_cast<CCHAR>(
+        GetShortPathNameW(fileName.c_str(), info->ShortName, 8));
   }
 }
 
@@ -325,9 +311,9 @@ void SetInfoFilename(LPVOID address, FILE_INFORMATION_CLASS infoClass,
           reinterpret_cast<FILE_FULL_DIR_INFORMATION *>(address), fileName);
     } break;
     case FileIdBothDirectoryInformation: {
-      //      SetInfoFilenameImplSN(
-      //          reinterpret_cast<FILE_ID_BOTH_DIR_INFORMATION *>(address),
-      //          fileName);
+      SetInfoFilenameImplSN(
+          reinterpret_cast<FILE_ID_BOTH_DIR_INFORMATION *>(address),
+          fileName);
     } break;
     default: {
       // NOP
@@ -400,14 +386,19 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
 {
   NTSTATUS res = STATUS_NO_SUCH_FILE;
   if (hdl != INVALID_HANDLE_VALUE) {
+    PVOID lastValidRecord = nullptr;
+    PVOID bufferInit = buffer;
     IO_STATUS_BLOCK status;
     res = NtQueryDirectoryFile(hdl, event, apcRoutine, apcContext, &status,
                                buffer, bufferSize, FileInformationClass,
                                returnSingleEntry, FileName, FALSE);
-    if ((res == STATUS_SUCCESS) && (status.Information > 0)) {
+
+    if ((res != STATUS_SUCCESS) || (status.Information <= 0)) {
+      bufferSize = 0UL;
+    } else {
       ULONG totalOffset   = 0;
       PVOID lastSkipPos   = nullptr;
-      ULONG_PTR finalSize = status.Information;
+
       while (totalOffset < status.Information) {
         ULONG offset;
         std::wstring fileName;
@@ -425,20 +416,14 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
             break;
           }
           // WARNING for the case where the fake name is longer this needs to
-          // move back all further
-          // results and update the offset first
-          /*
+          // move back all further results and update the offset first
           SetInfoFilename(buffer, FileInformationClass, fakeName);
           fileName = fakeName;
-          */
         }
         bool add = true;
         if (fileName.length() > 0) {
-          std::wstring fileNameL = fileName;
-          boost::algorithm::to_lower(fileNameL);
-          // add = foundFiles.find(fileNameL) == foundFiles.end();
-          auto res = foundFiles.insert(fileNameL);
-          add      = res.second; // add only if we didn't find this file before
+          auto insertRes = foundFiles.insert(ush::to_upper(fileName));
+          add      = insertRes.second; // add only if we didn't find this file before
         }
         // size of this block is determined by the offset in the info structure,
         // unless its the last element, then its size is the remaining buffer
@@ -446,29 +431,35 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
         ULONG size
             = offset != 0
                   ? offset
-                  : (static_cast<ULONG>(status.Information) - totalOffset) + 4;
-
+                  : (static_cast<ULONG>(status.Information) - totalOffset);
         if (!add) {
           if (lastSkipPos == nullptr) {
             lastSkipPos = buffer;
           }
-          finalSize -= size;
         } else {
           if (lastSkipPos != nullptr) {
             memmove(lastSkipPos, buffer, status.Information - totalOffset);
+            totalOffset -= static_cast<ULONG>(ush::AddrDiff(buffer, lastSkipPos));
+            buffer = lastSkipPos;
             lastSkipPos = nullptr;
           }
+          lastValidRecord = buffer;
         }
-        buffer = usvfs::shared::AddrAdd(buffer, size);
+        buffer = ush::AddrAdd(buffer, size);
         totalOffset += size;
       }
-      bufferSize = static_cast<ULONG>(finalSize);
+
       if (lastSkipPos != nullptr) {
+        buffer = lastSkipPos;
+        bufferSize = static_cast<ULONG>(ush::AddrDiff(buffer, bufferInit));
         // null out the unused rest if there is some
-        memset(lastSkipPos, 0, status.Information - finalSize);
+        memset(lastSkipPos, 0, status.Information - bufferSize);
+      } else {
+        bufferSize = static_cast<ULONG>(ush::AddrDiff(buffer, bufferInit));
       }
-    } else {
-      bufferSize = 0UL;
+    }
+    if (lastValidRecord != nullptr) {
+      SetInfoOffset(lastValidRecord, FileInformationClass, 0);
     }
   }
   return res;
@@ -508,7 +499,7 @@ struct Searches {
 
   Searches &operator=(const Searches &) = delete;
 
-  std::recursive_timed_mutex queryMutex;
+  std::recursive_mutex queryMutex;
 
   std::map<HANDLE, Info> info;
 };
@@ -526,21 +517,22 @@ void gatherVirtualEntries(const UnicodeString &dirName,
   }
   auto node = redir->findNode(boost::filesystem::path(dirNameW));
   if (node.get() != nullptr) {
-    std::string searchPattern
-        = FileName != nullptr ? ush::string_cast<std::string>(FileName->Buffer)
-                              : "*.*";
+    std::string searchPattern = FileName != nullptr
+                                    ? ush::string_cast<std::string>(
+                                          FileName->Buffer, ush::CodePage::UTF8)
+                                    : "*.*";
 
     for (const auto &subNode : node->find(searchPattern)) {
       if (((subNode->data().linkTarget.length() > 0) || subNode->isDirectory())
           && !subNode->hasFlag(usvfs::shared::FLAG_DUMMY)) {
-        std::wstring vName = ush::string_cast<std::wstring>(subNode->name());
+        std::wstring vName = ush::string_cast<std::wstring>(
+            subNode->name(), ush::CodePage::UTF8);
+
         Searches::Info::VirtualMatch m{
-            ush::string_cast<std::wstring>(subNode->data().linkTarget), vName};
+            ush::string_cast<std::wstring>(subNode->data().linkTarget.c_str(),
+                                           ush::CodePage::UTF8), vName};
         info.virtualMatches.push_back(m);
-        boost::algorithm::to_lower(vName);
-        //info.foundFiles.insert(vName);
-        auto res = info.foundFiles.insert(vName);
-        bool add = res.second;
+        info.foundFiles.insert(ush::to_upper(vName));
       }
     }
   }
@@ -578,7 +570,8 @@ bool addVirtualSearchResult(PVOID &FileInformation,
         dirName.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   }
-  std::wstring fileName = fullPath.filename().wstring();
+  std::wstring fileName = ush::string_cast<std::wstring>(
+      fullPath.filename().string(), ush::CodePage::UTF8);
   NTSTATUS subRes = addNtSearchData(
       info.currentSearchHandle,
       (fileName != L".")
@@ -586,7 +579,6 @@ bool addVirtualSearchResult(PVOID &FileInformation,
           : nullptr,
       virtualName, FileInformationClass, FileInformation, dataRead,
       info.foundFiles, nullptr, nullptr, nullptr, ReturnSingleEntry);
-
   if (subRes == STATUS_SUCCESS) {
     return true;
   } else {
@@ -618,7 +610,6 @@ NTSTATUS WINAPI usvfs::hooks::NtQueryDirectoryFile(
   // if we don't add the regular files first, "." and ".." wouldn't be in the
   //   first search result of wildcard searches which may confuse the caller
   NTSTATUS res = STATUS_NO_MORE_FILES;
-
   HOOK_START_GROUP(MutExHookGroup::FIND_FILES)
   if (!callContext.active()) {
     return ::NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
@@ -627,27 +618,35 @@ NTSTATUS WINAPI usvfs::hooks::NtQueryDirectoryFile(
                                   FileName, RestartScan);
   }
 
-  HookContext::ConstPtr context = HookContext::readAccess();
-  Searches &activeSearches      = context->customData<Searches>(SearchInfo);
-  std::lock_guard<std::recursive_timed_mutex> lock(activeSearches.queryMutex);
+//  std::unique_lock<std::recursive_mutex> queryLock;
+  std::map<HANDLE, Searches::Info>::iterator infoIter;
+  bool firstSearch = false;
 
-  if (RestartScan) {
-    auto iter = activeSearches.info.find(FileHandle);
-    if (iter != activeSearches.info.end()) {
-      activeSearches.info.erase(iter);
+  { // scope to limit context lifetime
+    HookContext::ConstPtr context = READ_CONTEXT();
+    Searches &activeSearches = context->customData<Searches>(SearchInfo);
+//    queryLock = std::unique_lock<std::recursive_mutex>(activeSearches.queryMutex);
+
+    if (RestartScan) {
+      auto iter = activeSearches.info.find(FileHandle);
+      if (iter != activeSearches.info.end()) {
+        activeSearches.info.erase(iter);
+      }
     }
+
+    // see if we already have a running search
+    infoIter = activeSearches.info.find(FileHandle);
+    firstSearch = (infoIter == activeSearches.info.end());
   }
 
-  // see if we already have a running search
-  auto infoIter = activeSearches.info.find(FileHandle);
-
-  bool firstSearch = (infoIter == activeSearches.info.end());
   if (firstSearch) {
-    std::unique_lock<std::recursive_timed_mutex> lock(
-        activeSearches.queryMutex, std::chrono::milliseconds(50));
-    if (!lock.owns_lock()) {
-      spdlog::get("hooks")->warn("danger! couldn't acquire lock");
-    }
+    HookContext::Ptr context = WRITE_CONTEXT();
+    Searches &activeSearches = context->customData<Searches>(SearchInfo);
+    // tradeoff time: we store this search status even if no virtual results
+    // were found. This causes a little extra cost here and in NtClose every
+    // time a non-virtual dir is being searched. However if we don't,
+    // whenever NtQueryDirectoryFile is called another time on the same handle,
+    // this (expensive) block would be run again.
     infoIter = activeSearches.info.insert(std::make_pair(FileHandle,
                                                          Searches::Info()))
                    .first;
@@ -656,9 +655,14 @@ NTSTATUS WINAPI usvfs::hooks::NtQueryDirectoryFile(
     SearchHandleMap &searchMap
         = context->customData<SearchHandleMap>(SearchHandles);
     SearchHandleMap::iterator iter = searchMap.find(FileHandle);
+
     UnicodeString searchPath;
     if (iter != searchMap.end()) {
       searchPath = UnicodeString(iter->second.c_str());
+      infoIter->second.currentSearchHandle =
+          CreateFileW(iter->second.c_str(), GENERIC_READ,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     } else {
       searchPath = UnicodeString(FileHandle);
     }
@@ -666,6 +670,7 @@ NTSTATUS WINAPI usvfs::hooks::NtQueryDirectoryFile(
                          infoIter->second);
   }
   ULONG dataRead = Length;
+  PVOID FileInformationCurrent = FileInformation;
 
   // add regular search results, skipping those files we have in a virtual
   // location
@@ -673,30 +678,35 @@ NTSTATUS WINAPI usvfs::hooks::NtQueryDirectoryFile(
   bool dataReturned = false;
   while (moreRegular && !dataReturned) {
     dataRead        = Length;
+
+    HANDLE handle = infoIter->second.currentSearchHandle;
+    if (handle == INVALID_HANDLE_VALUE) {
+      handle = FileHandle;
+    }
+
     NTSTATUS subRes = addNtSearchData(
-        FileHandle, FileName, L"", FileInformationClass, FileInformation,
+        handle, FileName, L"", FileInformationClass, FileInformationCurrent,
         dataRead, infoIter->second.foundFiles, Event, ApcRoutine, ApcContext,
         ReturnSingleEntry);
     moreRegular = subRes == STATUS_SUCCESS;
-
     if (moreRegular) {
       dataReturned = dataRead != 0;
     } else {
       infoIter->second.regularComplete = true;
       infoIter->second.foundFiles.clear();
+      if (infoIter->second.currentSearchHandle != INVALID_HANDLE_VALUE) {
+        ::CloseHandle(infoIter->second.currentSearchHandle);
+        infoIter->second.currentSearchHandle = INVALID_HANDLE_VALUE;
+      }
     }
   }
-
-  // don't use the search pattern next iteration
-  //      infoIter->second.searchPattern.resize(0);
-
   if (!moreRegular) {
     // add virtual results
     while (!dataReturned && infoIter->second.virtualMatches.size() > 0) {
       auto matchIter = infoIter->second.virtualMatches.rbegin();
       if (matchIter->realPath.size() != 0) {
         dataRead = Length;
-        if (addVirtualSearchResult(FileInformation, FileInformationClass,
+        if (addVirtualSearchResult(FileInformationCurrent, FileInformationClass,
                                    infoIter->second, matchIter->realPath,
                                    matchIter->virtualName, ReturnSingleEntry,
                                    dataRead)) {
@@ -730,28 +740,35 @@ NTSTATUS WINAPI usvfs::hooks::NtQueryDirectoryFile(
   IoStatusBlock->Information = dataRead;
 
   size_t numVirtualFiles = infoIter->second.virtualMatches.size();
-  if (numVirtualFiles >= 0) {
+  if ((numVirtualFiles > 0)) {
     LOG_CALL()
         .addParam("path", UnicodeString(FileHandle))
         .PARAM(FileInformationClass)
         .PARAMWRAP(FileName)
         .PARAM(numVirtualFiles)
-        .PARAMWRAP(res)
-        .PARAMHEX(::GetLastError());
+        .PARAMWRAP(res);
   }
 
   HOOK_END
   return res;
 }
 
-std::shared_ptr<OBJECT_ATTRIBUTES>
-makeObjectAttributes(UnicodeString &path, POBJECT_ATTRIBUTES attributeTemplate)
+unique_ptr_deleter<OBJECT_ATTRIBUTES>
+makeObjectAttributes(std::pair<UnicodeString, bool> &redirInfo,
+                     POBJECT_ATTRIBUTES attributeTemplate)
 {
-  std::shared_ptr<OBJECT_ATTRIBUTES> result(new OBJECT_ATTRIBUTES);
-  memcpy(result.get(), attributeTemplate, sizeof(OBJECT_ATTRIBUTES));
-  result->RootDirectory = nullptr;
-  result->ObjectName    = static_cast<PUNICODE_STRING>(path);
-  return result;
+  if (redirInfo.second) {
+    unique_ptr_deleter<OBJECT_ATTRIBUTES> result(
+        new OBJECT_ATTRIBUTES, [](OBJECT_ATTRIBUTES *ptr) { delete ptr; });
+    memcpy(result.get(), attributeTemplate, sizeof(OBJECT_ATTRIBUTES));
+    result->RootDirectory = nullptr;
+    result->ObjectName    = static_cast<PUNICODE_STRING>(redirInfo.first);
+    return result;
+  } else {
+    // just reuse the template with a dummy deleter
+    return unique_ptr_deleter<OBJECT_ATTRIBUTES>(attributeTemplate,
+                                                 [](OBJECT_ATTRIBUTES *) {});
+  }
 }
 
 NTSTATUS WINAPI usvfs::hooks::NtOpenFile(PHANDLE FileHandle,
@@ -769,49 +786,48 @@ NTSTATUS WINAPI usvfs::hooks::NtOpenFile(PHANDLE FileHandle,
       && ((OpenOptions & FILE_OPEN_FOR_BACKUP_INTENT) != 0UL)) {
     // this may be an attempt to open a directory handle for iterating.
     // If so we need to treat it a little bit differently
+/*    usvfs::FunctionGroupLock lock(usvfs::MutExHookGroup::FILE_ATTRIBUTES);
     FILE_BASIC_INFORMATION dummy;
-    storePath = FAILED(NtQueryAttributesFile(ObjectAttributes, &dummy));
+    storePath = FAILED(NtQueryAttributesFile(ObjectAttributes, &dummy));*/
+    storePath = true;
   }
 
   UnicodeString fullName = CreateUnicodeString(ObjectAttributes);
 
-  if (!callContext.active() || (fullName.size() == 0)
+  if ((fullName.size() == 0)
       || (GetFileSize(ObjectAttributes->RootDirectory, nullptr)
           != INVALID_FILE_SIZE)) {
-    res = ::NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
-                       IoStatusBlock, ShareAccess, OpenOptions);
-    return res;
+    return ::NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
+                        IoStatusBlock, ShareAccess, OpenOptions);
   }
 
   try {
-    HookContext::ConstPtr context        = HookContext::readAccess();
-    std::pair<UnicodeString, bool> redir = applyReroute(context, fullName);
-    std::shared_ptr<OBJECT_ATTRIBUTES> adjustedAttributes
-        = makeObjectAttributes(redir.first, ObjectAttributes);
+    std::pair<UnicodeString, bool> redir
+        = applyReroute(READ_CONTEXT(), callContext, fullName);
+    unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
+        = makeObjectAttributes(redir, ObjectAttributes);
 
     PRE_REALCALL
     res = ::NtOpenFile(FileHandle, DesiredAccess, adjustedAttributes.get(),
                        IoStatusBlock, ShareAccess, OpenOptions);
     POST_REALCALL
-
     if (SUCCEEDED(res) && storePath) {
       // store the original search path for use during iteration
-      HookContext::ConstPtr context = HookContext::readAccess();
-      context->customData<SearchHandleMap>(SearchHandles)[*FileHandle]
+      READ_CONTEXT()
+          ->customData<SearchHandleMap>(SearchHandles)[*FileHandle]
           = static_cast<LPCWSTR>(fullName);
 #pragma message("need to clean up this handle in CloseHandle call")
     }
 
-    if (redir.second || context->debugMode()) {
+    if (redir.second) {
       LOG_CALL()
           .addParam("source", ObjectAttributes)
           .addParam("rerouted", adjustedAttributes.get())
           .PARAM(*FileHandle)
+          .PARAM(OpenOptions)
           .PARAMWRAP(res);
     }
-  } catch (const std::exception &e) {
-    spdlog::get("hooks")->info("NtOpenFile: {}", e.what());
-
+  } catch (const std::exception&) {
     PRE_REALCALL
     res = ::NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
                        IoStatusBlock, ShareAccess, OpenOptions);
@@ -841,7 +857,6 @@ NTSTATUS WINAPI usvfs::hooks::NtCreateFile(
     ULONG EaLength)
 {
   NTSTATUS res = STATUS_NO_SUCH_FILE;
-
   HOOK_START_GROUP(MutExHookGroup::OPEN_FILE)
   if (!callContext.active()) {
     return ::NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
@@ -849,8 +864,6 @@ NTSTATUS WINAPI usvfs::hooks::NtCreateFile(
                           ShareAccess, CreateDisposition, CreateOptions,
                           EaBuffer, EaLength);
   }
-
-  HookContext::ConstPtr context = HookContext::readAccess();
 
   UnicodeString inPath = CreateUnicodeString(ObjectAttributes);
 
@@ -864,35 +877,43 @@ NTSTATUS WINAPI usvfs::hooks::NtCreateFile(
                           EaBuffer, EaLength);
   }
 
-  std::pair<UnicodeString, bool> redir = applyReroute(context, inPath);
+  std::pair<UnicodeString, bool> redir(UnicodeString(), false);
 
-  // TODO would be neat if this could (optionally) reroute all potential write
-  // accesses to the create target.
-  //   This could be achived by copying the file to the target here in case the
-  //   createdisposition or the requested
-  //   access rights make that necessary
-  if (((CreateDisposition == FILE_SUPERSEDE)
-       || (CreateDisposition == FILE_CREATE)
-       || (CreateDisposition == FILE_OPEN_IF)
-       || (CreateDisposition == FILE_OVERWRITE_IF))
-      && !redir.second && !fileExists(inPath)) {
-    // the file will be created so now we need to know where
-    std::pair<UnicodeString, UnicodeString> createTarget
-        = findCreateTarget(context, inPath);
+  { // limit context scope
+    FunctionGroupLock lock(MutExHookGroup::ALL_GROUPS);
+    HookContext::ConstPtr context = READ_CONTEXT();
 
-    if (createTarget.second.size() != 0) {
-      // there is a reroute target for new files so adjust the path
-      //UnicodeString relative = inPath.subString(createTarget.first.size());
-      redir.first = createTarget.second/*.appendPath(
-          static_cast<PUNICODE_STRING>(relative))*/;
+    redir = applyReroute(context, callContext, inPath);
 
-spdlog::get("hooks")->info("reroute write access: {}",
-                           ush::string_cast<std::string>(static_cast<LPCWSTR>(redir.first)).c_str());
+    // TODO would be neat if this could (optionally) reroute all potential write
+    // accesses to the create target.
+    //   This could be achived by copying the file to the target here in case
+    //   the createdisposition or the requested access rights make that
+    //   necessary
+    if (((CreateDisposition == FILE_SUPERSEDE)
+         || (CreateDisposition == FILE_CREATE)
+         || (CreateDisposition == FILE_OPEN_IF)
+         || (CreateDisposition == FILE_OVERWRITE_IF))
+        && !redir.second && !fileExists(inPath)) {
+      // the file will be created so now we need to know where
+      std::pair<UnicodeString, UnicodeString> createTarget
+          = findCreateTarget(context, inPath);
+
+      if (createTarget.second.size() != 0) {
+        // there is a reroute target for new files so adjust the path
+        redir.first.resize(4);
+        redir.first.appendPath(static_cast<PUNICODE_STRING>(createTarget.second));
+
+        spdlog::get("hooks")->info(
+            "reroute write access: {}",
+            ush::string_cast<std::string>(static_cast<LPCWSTR>(redir.first))
+                .c_str());
+      }
     }
   }
 
-  std::shared_ptr<OBJECT_ATTRIBUTES> adjustedAttributes
-      = makeObjectAttributes(redir.first, ObjectAttributes);
+  unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
+      = makeObjectAttributes(redir, ObjectAttributes);
 
   PRE_REALCALL
   res = ::NtCreateFile(FileHandle, DesiredAccess, adjustedAttributes.get(),
@@ -901,7 +922,7 @@ spdlog::get("hooks")->info("reroute write access: {}",
                        EaLength);
   POST_REALCALL
 
-  if (redir.second || context->debugMode()) {
+  if (redir.second) {
     LOG_CALL()
         .addParam("source", ObjectAttributes)
         .addParam("rerouted", adjustedAttributes.get())
@@ -919,27 +940,30 @@ NTSTATUS WINAPI usvfs::hooks::NtClose(HANDLE Handle)
 {
   NTSTATUS res = STATUS_NO_SUCH_FILE;
 
-  HOOK_START
+  HOOK_START_GROUP(MutExHookGroup::ALL_GROUPS)
   bool log = false;
-  HookContext::ConstPtr context = HookContext::readAccess();
 
-  { // clean up search data associated with this handle part 1
-    Searches &activeSearches = context->customData<Searches>(SearchInfo);
-    std::lock_guard<std::recursive_timed_mutex> lock(activeSearches.queryMutex);
-    auto iter = activeSearches.info.find(Handle);
-    if (iter != activeSearches.info.end()) {
-      activeSearches.info.erase(iter);
-      log = true;
+  if ((::GetFileType(Handle) == FILE_TYPE_DISK)) {
+    HookContext::Ptr context = WRITE_CONTEXT();
+
+    { // clean up search data associated with this handle part 1
+      Searches &activeSearches = context->customData<Searches>(SearchInfo);
+//      std::lock_guard<std::recursive_mutex> lock(activeSearches.queryMutex);
+      auto iter = activeSearches.info.find(Handle);
+      if (iter != activeSearches.info.end()) {
+        activeSearches.info.erase(iter);
+        log = true;
+      }
     }
-  }
 
-  {
-    SearchHandleMap &searchHandles
-        = context->customData<SearchHandleMap>(SearchHandles);
-    auto iter = searchHandles.find(Handle);
-    if (iter != searchHandles.end()) {
-      searchHandles.erase(iter);
-      log = true;
+    {
+      SearchHandleMap &searchHandles
+          = context->customData<SearchHandleMap>(SearchHandles);
+      auto iter = searchHandles.find(Handle);
+      if (iter != searchHandles.end()) {
+        searchHandles.erase(iter);
+        log = true;
+      }
     }
   }
 
@@ -948,7 +972,6 @@ NTSTATUS WINAPI usvfs::hooks::NtClose(HANDLE Handle)
   POST_REALCALL
 
   if (log) {
-    // this is a bit noisy
     LOG_CALL().PARAM(Handle).PARAMWRAP(res);
   }
 
@@ -963,30 +986,20 @@ NTSTATUS WINAPI usvfs::hooks::NtQueryAttributesFile(
 {
   NTSTATUS res = STATUS_SUCCESS;
 
-  HOOK_START
+  HOOK_START_GROUP(MutExHookGroup::FILE_ATTRIBUTES)
 
-  if (!callContext.active()) {
-    return ::NtQueryAttributesFile(ObjectAttributes, FileInformation);
-  }
+  UnicodeString inPath = CreateUnicodeString(ObjectAttributes);
 
-  HookContext::ConstPtr context = HookContext::readAccess();
-
-  UnicodeString inPath;
-  try {
-    inPath = CreateUnicodeString(ObjectAttributes);
-  } catch (const std::exception &) {
-    return ::NtQueryAttributesFile(ObjectAttributes, FileInformation);
-  }
-
-  std::pair<UnicodeString, bool> redir = applyReroute(context, inPath);
-  std::shared_ptr<OBJECT_ATTRIBUTES> adjustedAttributes
-      = makeObjectAttributes(redir.first, ObjectAttributes);
+  std::pair<UnicodeString, bool> redir
+      = applyReroute(READ_CONTEXT(), callContext, inPath);
+  unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
+      = makeObjectAttributes(redir, ObjectAttributes);
 
   PRE_REALCALL
   res = ::NtQueryAttributesFile(adjustedAttributes.get(), FileInformation);
   POST_REALCALL
 
-  if (true || redir.second) {
+  if (redir.second) {
     LOG_CALL()
         .addParam("source", ObjectAttributes)
         .addParam("rerouted", adjustedAttributes.get())
@@ -1004,13 +1017,11 @@ NTSTATUS WINAPI usvfs::hooks::NtQueryFullAttributesFile(
 {
   NTSTATUS res = STATUS_SUCCESS;
 
-  HOOK_START
+  HOOK_START_GROUP(MutExHookGroup::FILE_ATTRIBUTES)
 
   if (!callContext.active()) {
     return ::NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
   }
-
-  HookContext::ConstPtr context = HookContext::readAccess();
 
   UnicodeString inPath;
   try {
@@ -1019,9 +1030,10 @@ NTSTATUS WINAPI usvfs::hooks::NtQueryFullAttributesFile(
     return ::NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
   }
 
-  std::pair<UnicodeString, bool> redir = applyReroute(context, inPath);
-  std::shared_ptr<OBJECT_ATTRIBUTES> adjustedAttributes
-      = makeObjectAttributes(redir.first, ObjectAttributes);
+  std::pair<UnicodeString, bool> redir
+      = applyReroute(READ_CONTEXT(), callContext, inPath);
+  unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
+      = makeObjectAttributes(redir, ObjectAttributes);
 
   PRE_REALCALL
   res = ::NtQueryFullAttributesFile(adjustedAttributes.get(), FileInformation);

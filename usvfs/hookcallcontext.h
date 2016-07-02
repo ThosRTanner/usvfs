@@ -22,6 +22,8 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 
 #include "windows_sane.h"
 
+#include <vector>
+
 
 namespace usvfs {
 
@@ -38,8 +40,12 @@ enum class MutExHookGroup : int {
   FIND_FILES = 4,
   LOAD_LIBRARY = 5,
   FULL_PATHNAME = 6,
+  SHELL_FILEOP = 7,
+  DELETE_FILE = 8,
+  GET_FILE_VERSION = 9,
+  GET_MODULE_HANDLE = 10,
 
-  NO_GROUP = 7,
+  NO_GROUP = 11,
   LAST = NO_GROUP,
 };
 
@@ -52,7 +58,12 @@ public:
   HookCallContext(MutExHookGroup group);
   ~HookCallContext();
 
-  void updateLastError();
+  HookCallContext(const HookCallContext &reference) = delete;
+  HookCallContext &operator=(const HookCallContext &reference) = delete;
+
+  void updateLastError(DWORD lastError = GetLastError());
+
+  DWORD lastError() const { return m_LastError; }
 
   bool active() const;
 

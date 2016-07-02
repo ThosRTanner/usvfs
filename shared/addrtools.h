@@ -22,6 +22,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 
 #include "windows_sane.h"
 #include <cstdint>
+#include <cstddef>
 
 namespace usvfs {
 
@@ -39,6 +40,11 @@ inline LPVOID AddrAdd(LPVOID address, size_t offset)
   return reinterpret_cast<LPVOID>(reinterpret_cast<LPBYTE>(address) + offset);
 }
 
+
+inline std::ptrdiff_t AddrDiff(LPVOID lhs, LPVOID rhs)
+{
+  return reinterpret_cast<LPBYTE>(lhs) - reinterpret_cast<LPBYTE>(rhs);
+}
 
 
 /// implicitly cast pointer to void*, from there cast to target type.

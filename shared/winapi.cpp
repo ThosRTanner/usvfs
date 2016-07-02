@@ -24,10 +24,11 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "logging.h"
 #include "ntdll_declarations.h"
 #include "unicodestring.h"
+#include "scopeguard.h"
 #include <Psapi.h>
 #include <algorithm>
 #include <spdlog.h>
-#include <format.h>
+#include <fmt/format.h>
 
 
 namespace ush = usvfs::shared;
@@ -83,8 +84,9 @@ std::wstring getModuleFileName(HMODULE module, HANDLE process)
   std::wstring result;
   result.resize(64);
   DWORD rc = 0UL;
+
   while ((rc = (process == INVALID_HANDLE_VALUE)
-                  ? GetModuleFileNameW(module, &result[0], static_cast<DWORD>(result.size()))
+                  ? ::GetModuleFileNameW(module, &result[0], static_cast<DWORD>(result.size()))
                   : ::GetModuleFileNameExW(process, module, &result[0], static_cast<DWORD>(result.size()))
          ) == result.size()) {
     result.resize(result.size() * 2);
@@ -140,6 +142,19 @@ std::wstring getCurrentDirectory()
   GetCurrentDirectoryW(required, &result[0]);
   result.resize(required - 1);
   return result;
+}
+
+std::wstring getKnownFolderPath(REFKNOWNFOLDERID folderID)
+{
+  PWSTR writablePath;
+
+  ::SHGetKnownFolderPath(folderID, 0, nullptr, &writablePath);
+
+  ON_BLOCK_EXIT([writablePath] () {
+    ::CoTaskMemFree(writablePath);
+  });
+
+  return std::wstring(writablePath);
 }
 
 }
@@ -359,7 +374,7 @@ std::wstring getSectionName(PVOID addressIn, HANDLE process)
   if (::EnumProcessModules(process, modules, sizeof(modules), &required)) {
     for (DWORD i = 0; i < (std::min<DWORD>(1024UL, required) / sizeof(HMODULE)); ++i) {
       std::pair<intptr_t, intptr_t> range = getSectionRange(modules[i]);
-      if ((address > range.first) || (address < range.second)) {
+      if ((address > range.first) && (address < range.second)) {
         try {
           return winapi::wide::getModuleFileName(modules[i], process);
         } catch (const std::exception&) {
@@ -378,12 +393,16 @@ std::vector<FileResult> quickFindFiles(LPCWSTR directoryName, LPCWSTR pattern)
   static const unsigned int BUFFER_SIZE = 1024;
 
   HANDLE hdl = CreateFileW(directoryName
-                             , GENERIC_READ
-                             , FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-                             , nullptr
-                             , OPEN_EXISTING
-                             , FILE_FLAG_BACKUP_SEMANTICS
-                             , nullptr);
+                           , GENERIC_READ
+                           , FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                           , nullptr
+                           , OPEN_EXISTING
+                           , FILE_FLAG_BACKUP_SEMANTICS
+                           , nullptr);
+
+  ON_BLOCK_EXIT([hdl] () {
+    CloseHandle(hdl);
+  });
 
   uint8_t buffer[BUFFER_SIZE];
 
@@ -392,16 +411,16 @@ std::vector<FileResult> quickFindFiles(LPCWSTR directoryName, LPCWSTR pattern)
     IO_STATUS_BLOCK status;
 
     res = NtQueryDirectoryFile(hdl
-                                 , nullptr
-                                 , nullptr
-                                 , nullptr
-                                 , &status
-                                 , buffer
-                                 , BUFFER_SIZE
-                                 , FileFullDirectoryInformation
-                                 , FALSE
-                                 , static_cast<PUNICODE_STRING>(usvfs::UnicodeString(pattern))
-                                 , FALSE);
+                               , nullptr
+                               , nullptr
+                               , nullptr
+                               , &status
+                               , buffer
+                               , BUFFER_SIZE
+                               , FileFullDirectoryInformation
+                               , FALSE
+                               , static_cast<PUNICODE_STRING>(usvfs::UnicodeString(pattern))
+                               , FALSE);
     if (res == STATUS_SUCCESS) {
       FILE_FULL_DIR_INFORMATION *info = reinterpret_cast<FILE_FULL_DIR_INFORMATION*>(buffer);
       void *endPos = buffer + status.Information;
@@ -421,6 +440,42 @@ std::vector<FileResult> quickFindFiles(LPCWSTR directoryName, LPCWSTR pattern)
   }
 
   return result;
+}
+
+void createPath(LPCWSTR path, LPSECURITY_ATTRIBUTES securityAttributes)
+{
+  std::unique_ptr<wchar_t, decltype(std::free) *> pathCopy{_wcsdup(path),
+                                                           std::free};
+
+  // writable copy of the path
+  wchar_t *current = pathCopy.get();
+
+  if ((wcsncmp(current, LR"(\\?\)", 4) == 0)
+      || (wcsncmp(current, LR"(\??\)", 4) == 0)) {
+    current += 4;
+  }
+
+  while (*current != L'\0') {
+    size_t len = wcscspn(current, L"\\/");
+    // may also be \0
+    wchar_t separator = current[len];
+    // don't try to create the drive letter, obviously
+    if ((len != 0) && ((len != 2) || (current[1] != ':'))) {
+      // temporarily cut the string at the current (back-)slash
+      current[len] = L'\0';
+      if (!::CreateDirectoryW(pathCopy.get(), securityAttributes)) {
+        DWORD err = ::GetLastError();
+        if ((err != ERROR_ALREADY_EXISTS) && (err != NOERROR)) {
+          throw usvfs::shared::windows_error(ush::string_cast<std::string>(
+              fmt::format(L"failed to create intermediate directory {}",
+                          pathCopy.get())));
+        }
+        // restore the path
+      }
+      current[len] = separator;
+    }
+    current += len + 1;
+  }
 }
 
 

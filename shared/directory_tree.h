@@ -24,15 +24,17 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "shared_memory.h"
 #include "scopeguard.h"
 #include "logging.h"
+#include "stringutils.h"
 #include <boost/predef.h>
-#include <boost/filesystem.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/format.hpp>
 #include "exceptionex.h"
 #include <boost/interprocess/containers/string.hpp>
 #include <boost/interprocess/containers/map.hpp>
 #include <boost/interprocess/containers/vector.hpp>
-#include <boost/interprocess/offset_ptr.hpp>
+#include <boost/multi_index_container.hpp>
+#include <boost/multi_index/ordered_index.hpp>
+#include <boost/multi_index/member.hpp>
 #include <boost/interprocess/smart_ptr/shared_ptr.hpp>
 #include <boost/interprocess/smart_ptr/weak_ptr.hpp>
 #include <boost/interprocess/smart_ptr/deleter.hpp>
@@ -44,8 +46,17 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include <iomanip>
 #include <memory>
 #include <cstdint>
+#include <codecvt>
 #include <spdlog.h>
 
+#if 1
+namespace fs = boost::filesystem;
+#include <boost/filesystem.hpp>
+#include <boost/filesystem/detail/utf8_codecvt_facet.hpp>
+#else
+#include <filesystem>
+namespace fs = std::tr2::sys;
+#endif
 
 
 // simplify unit tests by allowing access to private members
@@ -74,12 +85,14 @@ template <typename T> T createDataEmpty(const VoidAllocatorT &allocator);
 
 template <typename T> void dataAssign(T &destination, const T &source);
 
-// crappy little workaround for boost::filesystem::path iterating over path separators
-boost::filesystem::path::iterator nextIter(const boost::filesystem::path::iterator &iter,
-                                           const boost::filesystem::path::iterator &end);
+// crappy little workaround for fs::path iterating over path separators
+fs::path::iterator nextIter(const fs::path::iterator &iter,
+                            const fs::path::iterator &end);
 
+void advanceIter(fs::path::iterator &iter, const fs::path::iterator &end);
 
 namespace bi = boost::interprocess;
+namespace bmi = boost::multi_index;
 
 typedef uint8_t TreeFlags;
 
@@ -93,6 +106,34 @@ static const MissingThrowT MissingThrow = MissingThrowT();
 
 
 template <typename NodeDataT> class TreeContainer;
+
+
+template <typename T1, typename T2, typename Alloc> struct mutable_pair {
+  typedef T1 first_type;
+  typedef T2 second_type;
+
+  mutable_pair(Alloc alloc) : first(T1(alloc)), second(T2(alloc))
+  {
+  }
+  mutable_pair(const T1 &f, const T2 &s) : first(f), second(s)
+  {
+  }
+  mutable_pair(const std::pair<T1, T2> &p) : first(p.first), second(p.second)
+  {
+  }
+
+  T1 first;
+  mutable T2 second;
+};
+
+template <typename Key, typename T, typename Compare, typename Allocator,
+          typename Element = mutable_pair<Key, T, Allocator>>
+using mimap = bmi::multi_index_container<
+  Element, bmi::indexed_by<
+    bmi::ordered_unique<
+      bmi::member<Element, Key,&Element::first>, Compare>
+    >, typename Allocator::template rebind<Element>::other
+>;
 
 /**
  * a representation of a directory tree in memory.
@@ -108,9 +149,22 @@ protected:
 
   struct CILess
   {
-    bool operator() (const StringT &lhs, const StringT &rhs) const
+    template <typename U, typename V>
+    bool operator() (const U &lhs, const V &rhs) const
     {
-      return _stricmp(lhs.c_str(), rhs.c_str()) < 0;
+      return _stricmp(getCharPtr(lhs), getCharPtr(rhs)) < 0;
+    }
+
+  private:
+    const char *getCharPtr(const StringT &s) const {
+      return s.c_str();
+    }
+
+    const char *getCharPtr(const std::string &s) const {
+      return s.c_str();
+    }
+    const char *getCharPtr(const char *s) const {
+      return s;
     }
   };
 
@@ -125,7 +179,7 @@ public:
 
   typedef bi::allocator<std::pair<const StringT, NodePtrT>, SegmentManagerT> NodeEntryAllocatorT;
 
-  typedef bi::map<StringT, NodePtrT, CILess, NodeEntryAllocatorT> NodeMapT;
+  typedef mimap<StringT, NodePtrT, CILess, NodeEntryAllocatorT> NodeMapT;
   typedef typename NodeMapT::iterator file_iterator;
   typedef typename NodeMapT::const_iterator const_file_iterator;
 
@@ -142,7 +196,7 @@ public:
    **/
   DirectoryTree(const std::string &name
                 , TreeFlags flags
-                , NodePtrT parent
+                , const NodePtrT &parent
                 , const NodeDataT &data
                 , const VoidAllocatorT &allocator)
     : m_Parent(parent)
@@ -176,12 +230,12 @@ public:
   /**
    * @return the full path to the node
    */
-  boost::filesystem::path path() const {
+  fs::path path() const {
     if (m_Parent.lock().get() == nullptr) {
       if (m_Name.size() == 0) {
-        return boost::filesystem::path();
+        return fs::path();
       } else {
-        return boost::filesystem::path(m_Name.c_str()) / "\\";
+        return fs::path(m_Name.c_str()) / "\\";
       }
     } else {
       return m_Parent.lock()->path() / m_Name.c_str();
@@ -204,8 +258,10 @@ public:
    * @brief setFlag change a flag for this node
    * @param enabled new state for the specified flag
    */
-  void setFlag(TreeFlags flag, bool enabled = true) { m_Flags = enabled ? m_Flags | flag
-                                                                        : m_Flags & ~flag; }
+  void setFlag(TreeFlags flag, bool enabled = true)
+  {
+    m_Flags = enabled ? m_Flags | flag : m_Flags & ~flag;
+  }
 
   /**
    * @return true if the specified flag is set, false otherwise
@@ -238,8 +294,9 @@ public:
    * @param path the path to look up
    * @return a pointer to the node or a null ptr
    */
-  NodePtrT findNode(const boost::filesystem::path &path) {
-    return findNode(path, path.begin());
+  NodePtrT findNode(const fs::path &path) {
+    fs::path::iterator iter = path.begin();
+    return findNode(path, iter);
   }
 
   /**
@@ -247,8 +304,9 @@ public:
    * @param path the path to look up
    * @return a pointer to the node or a null ptr
    */
-  const NodePtrT findNode(const boost::filesystem::path &path) const {
-    return findNode(path, path.begin());
+  const NodePtrT findNode(const fs::path &path) const {
+    fs::path::iterator iter = path.begin();
+    return findNode(path, iter);
   }
 
   /**
@@ -256,8 +314,9 @@ public:
    * @param path the path to visit
    * @param visitor a function called for each node
    */
-  void visitPath(const boost::filesystem::path &path, const VisitorFunction &visitor) const {
-    visitPath(path, path.begin(), visitor);
+  void visitPath(const fs::path &path, const VisitorFunction &visitor) const {
+    fs::path::iterator iter = path.begin();
+    visitPath(path, iter, visitor);
   }
 
   /**
@@ -266,7 +325,7 @@ public:
    * @return the node found or an empty pointer if no such node was found
    */
   NodePtrT node(const char *name, MissingThrowT) const {
-    auto iter = m_Nodes.find(StringT(name, m_Nodes.get_allocator()));
+    auto iter = m_Nodes.find(name);
     if (iter != m_Nodes.end()) {
       return iter->second;
     } else {
@@ -280,7 +339,7 @@ public:
    * @return the node found or an empty pointer if no such node was found
    */
   NodePtrT node(const char *name) {
-    auto iter = m_Nodes.find(StringT(name, m_Nodes.get_allocator()));
+    auto iter = m_Nodes.find(name);
     if (iter != m_Nodes.end()) {
       return iter->second;
     } else {
@@ -294,7 +353,7 @@ public:
    * @return the node found or an empty pointer if no such node was found
    */
   const NodePtrT node(const char *name, MissingThrowT) {
-    auto iter = m_Nodes.find(StringT(name, m_Nodes.get_allocator()));
+    auto iter = m_Nodes.find(name);
     if (iter != m_Nodes.end()) {
       return iter->second;
     } else {
@@ -308,7 +367,7 @@ public:
    * @return the node found or an empty pointer if no such node was found
    */
   const NodePtrT node(const char *name) const {
-    auto iter = m_Nodes.find(StringT(name, m_Nodes.get_allocator()));
+    auto iter = m_Nodes.find(name);
     if (iter != m_Nodes.end()) {
       return iter->second;
     } else {
@@ -322,7 +381,7 @@ public:
    * @return true if the node exists, false otherwise
    */
   bool exists(const char *name) const {
-    return m_Nodes.find(StringT(name, m_Nodes.get_allocator())) != m_Nodes.end();
+    return m_Nodes.find(name) != m_Nodes.end();
   }
 
   /**
@@ -340,9 +399,10 @@ public:
     std::vector<NodePtrT> result;
 
     if (fixedPart != std::string::npos) {
-      // if there is a prefix, search for the node representing that path and search
-      // only on that
-      NodePtrT node = findNode(boost::filesystem::path(pattern.substr(0, fixedPart)));
+      // if there is a prefix, search for the node representing that path and
+      // search only on that
+      NodePtrT node
+          = findNode(fs::path(pattern.substr(0, fixedPart)));
       if (node.get() != nullptr) {
         node->findLocal(result, pattern.substr(fixedPart + 1));
       }
@@ -385,7 +445,22 @@ public:
     m_Nodes.clear();
   }
 
+  void removeFromTree() {
+    if (auto par = parent()) {
+      spdlog::get("usvfs")->info("remove from tree {}", m_Name);
+      auto self = par->m_Nodes.find(m_Name);
+      par->erase(self);
+    }
+  }
+
 PRIVATE:
+
+  void set(const StringT &key, const NodePtrT &value) {
+    auto res = m_Nodes.emplace(key, value);
+    if (!res.second) {
+      res.first->second = value;
+    }
+  }
 
   WeakPtrT findRoot() const
   {
@@ -396,10 +471,11 @@ PRIVATE:
     }
   }
 
-  NodePtrT findNode(const boost::filesystem::path &name, boost::filesystem::path::iterator iter) {
-    auto subNode = m_Nodes.find(StringT(iter->string().c_str(), m_Nodes.get_allocator()));
-    boost::filesystem::path::iterator next = nextIter(iter, name.end());
-    if (next == name.end()) {
+  NodePtrT findNode(const fs::path &name, fs::path::iterator &iter) {
+    std::string l = iter->string();
+    auto subNode = m_Nodes.find(iter->string());
+    advanceIter(iter, name.end());
+    if (iter == name.end()) {
       // last name component, should be a local node
       if (subNode != m_Nodes.end()) {
         return subNode->second;
@@ -408,17 +484,18 @@ PRIVATE:
       }
     } else {
       if (subNode != m_Nodes.end()) {
-        return subNode->second->findNode(name, next);
+        return subNode->second->findNode(name, iter);
       } else {
         return NodePtrT();
       }
     }
   }
 
-  const NodePtrT findNode(const boost::filesystem::path &name, boost::filesystem::path::iterator iter) const {
-    auto subNode = m_Nodes.find(StringT(iter->string().c_str(), m_Nodes.get_allocator()));
-    boost::filesystem::path::iterator next = nextIter(iter, name.end());
-    if (next == name.end()) {
+  const NodePtrT findNode(const fs::path &name,
+                          fs::path::iterator &iter) const {
+    auto subNode = m_Nodes.find(iter->string());
+    advanceIter(iter, name.end());
+    if (iter == name.end()) {
       // last name component, should be a local node
       if (subNode != m_Nodes.end()) {
         return subNode->second;
@@ -427,22 +504,22 @@ PRIVATE:
       }
     } else {
       if (subNode != m_Nodes.end()) {
-        return subNode->second->findNode(name, next);
+        return subNode->second->findNode(name, iter);
       } else {
         return NodePtrT();
       }
     }
   }
 
-  void visitPath(const boost::filesystem::path &path
-                 , boost::filesystem::path::iterator iter
+  void visitPath(const fs::path &path
+                 , fs::path::iterator &iter
                  , const VisitorFunction &visitor) const {
-    auto subNode = m_Nodes.find(StringT(iter->string().c_str(), m_Nodes.get_allocator()));
+    auto subNode = m_Nodes.find(iter->string());
     if (subNode != m_Nodes.end()) {
       visitor(subNode->second);
-      auto next = nextIter(iter, path.end());
-      if (next != path.end()) {
-        subNode->second->visitPath(path, next, visitor);
+      advanceIter(iter, path.end());
+      if (iter != path.end()) {
+        subNode->second->visitPath(path, iter, visitor);
       }
     }
   }
@@ -510,10 +587,15 @@ public:
     : m_TreeMeta(nullptr)
     , m_SHMName(SHMName)
   {
+    std::locale global_loc = std::locale();
+    std::locale loc(global_loc, new fs::detail::utf8_codecvt_facet);
+    fs::path::imbue(loc);
+
     namespace sp = std::placeholders;
     std::regex pattern(R"exp((.*_)(\d+))exp");
     std::smatch match;
-    regex_match(std::string(m_SHMName.c_str()), match, pattern);
+    std::string shmName(m_SHMName.c_str());
+    regex_match(shmName, match, pattern);
     if (match.size() != 3) {
       m_SHMName += "_1";
     }
@@ -523,6 +605,10 @@ public:
                                m_SHMName, m_TreeMeta->tree->numNodesRecursive(),
                                m_SHM->get_size());
   }
+
+  TreeContainer(const TreeContainer &reference) = delete;
+
+  TreeContainer &operator=(const TreeContainer &reference) = delete;
 
   ~TreeContainer() {
     if (unassign(m_SHM, m_TreeMeta)) {
@@ -591,7 +677,7 @@ public:
    * @return pointer to the new node or a null ptr
    **/
   template <typename T>
-  typename TreeT::NodePtrT addFile(const boost::filesystem::path &name
+  typename TreeT::NodePtrT addFile(const fs::path &name
                                    , const T &data
                                    , TreeFlags flags = 0
                                    , bool overwrite = true) {
@@ -615,16 +701,23 @@ public:
    * @return pointer to the new node or a null ptr
    **/
   template <typename T>
-  typename TreeT::NodePtrT addDirectory(const boost::filesystem::path &name, const T &data,
-                                        TreeFlags flags = 0, bool overwrite = true) {
+  typename TreeT::NodePtrT addDirectory(const fs::path &name,
+                                        const T &data, TreeFlags flags = 0,
+                                        bool overwrite = true)
+  {
     using namespace std::placeholders;
     try {
-      return addNode(m_TreeMeta->tree.get(), name, name.begin(), data, overwrite,
-                     flags | FLAG_DIRECTORY, allocator());
-    } catch (const bi::bad_alloc&) {
+      return addNode(m_TreeMeta->tree.get(), name, name.begin(), data,
+                     overwrite, flags | FLAG_DIRECTORY, allocator());
+    } catch (const bi::bad_alloc &) {
       reassign();
       return addDirectory(name, data, flags, overwrite);
     }
+  }
+
+  void getBuffer(void *&buffer, size_t &bufferSize) const {
+    buffer = m_SHM->get_address();
+    bufferSize = m_SHM->get_size();
   }
 
 private:
@@ -634,7 +727,7 @@ private:
       : tree(segmentManager->construct<TreeT>(bi::anonymous_instance)(
              "", true, TreeT::NodePtrT(), data, VoidAllocatorT(segmentManager)))
     { }
-    bi::offset_ptr<TreeT, std::int32_t, std::uint64_t, 4> tree;
+    OffsetPtrT<TreeT> tree;
     long referenceCount { 0 }; // reference count only set on top level node
     bool outdated { false };
 
@@ -662,11 +755,6 @@ private:
         , TreeT::NodePtrT()
         , createData<TreeT::DataT, T>(data, allocator)
         , manager);
-
-    // this seems to cause slightly less overhead but causes crashes on
-    // x64 builds during drestruction of the TreeT
-/*    void *mem = manager->allocate(sizeof(TreeT));
-    return new(mem) TreeT(name, flags, TreeT::NodePtrT(), createData<TreeT::DataT, T>(data, allocator), manager);*/
   }
 
   typename TreeT::NodePtrT createSubPtr(TreeT *subNode)
@@ -676,30 +764,29 @@ private:
   }
 
   template <typename T>
-  typename TreeT::NodePtrT addNode(DirectoryTree<typename TreeT::DataT> *base
-                                   , const boost::filesystem::path &name
-                                   , boost::filesystem::path::iterator iter
+  typename TreeT::NodePtrT addNode(TreeT *base
+                                   , const fs::path &name
+                                   , fs::path::iterator iter
                                    , const T &data
                                    , bool overwrite
                                    , unsigned int flags
                                    , const VoidAllocatorT &allocator) {
-    boost::filesystem::path::iterator next = nextIter(iter, name.end());
+    fs::path::iterator next = nextIter(iter, name.end());
     StringT iterString(iter->string().c_str(), allocator);
     if (next == name.end()) {
-      typename TreeT::NodePtrT newNode = this->get()->node(iter->string().c_str());
+      typename TreeT::NodePtrT newNode = base->node(iter->string().c_str());
 
       if (newNode.get() == nullptr) {
         // last name component, should be the filename
         TreeT *node = createSubNode(allocator, iter->string(), flags, data);
-
         newNode = createSubPtr(node);
-      }
-      newNode->m_Self = TreeT::WeakPtrT(newNode);
-
-      newNode->m_Parent = base->m_Self;
-
-      if (overwrite) {
-        base->m_Nodes[iterString] = newNode;
+        newNode->m_Self = TreeT::WeakPtrT(newNode);
+        newNode->m_Parent = base->m_Self;
+        base->set(iterString, newNode);
+        return newNode;
+      } else if (overwrite) {
+        newNode->m_Data = createData<TreeT::DataT, T>(data, allocator);
+        newNode->m_Flags = static_cast<usvfs::shared::TreeFlags>(flags);
         return newNode;
       } else {
         auto res = base->m_Nodes.insert(std::make_pair(iterString, newNode));
@@ -740,7 +827,7 @@ private:
       newNode->m_Self = newNodePtr;
       TreeT *source = reinterpret_cast<TreeT*>(kv.second.get().get());
       copyTree(newNode, source);
-      destination->m_Nodes[newNode->m_Name] = newNodePtr;
+      destination->set(newNode->m_Name, newNodePtr);
       newNode->m_Parent = destination->m_Self;
     }
   }
@@ -766,7 +853,7 @@ private:
       spdlog::get("usvfs")->info("{} opened in process {}",
                                  SHMName, ::GetCurrentProcessId());
     } catch (const bi::interprocess_exception&) {
-      newSHM = new SharedMemoryT(bi::create_only, SHMName, size);
+      newSHM = new SharedMemoryT(bi::create_only, SHMName, static_cast<unsigned int>(size));
       spdlog::get("usvfs")->info("{} created in process {}",
                                  SHMName, ::GetCurrentProcessId());
     }
@@ -775,8 +862,6 @@ private:
 
   TreeMeta *activateSHM(SharedMemoryT *shm, const char *SHMName)
   {
-    spdlog::get("usvfs")->info("name: {0} - {2:p} -> {1:p}", SHMName, (void*)shm, (void*)m_SHM.get());
-
     std::shared_ptr<SharedMemoryT> oldSHM = m_SHM;
 
     m_SHM.reset(shm);
@@ -823,6 +908,9 @@ private:
 
   bool unassign(const std::shared_ptr<SharedMemoryT> &shm, TreeMeta *tree)
   {
+    if (tree == nullptr) {
+      return true;
+    }
     if (decreaseRefCount(tree) == 0) {
       shm->get_segment_manager()->destroy_ptr(tree);
       return true;

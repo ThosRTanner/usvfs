@@ -25,6 +25,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "exceptionex.h"
 #include "usvfs.h"
 #include <utility.h>
+#include <ttrampolinepool.h>
 #include <stdexcept>
 #include <boost/format.hpp>
 #include <boost/filesystem.hpp>
@@ -46,7 +47,7 @@ namespace usvfs {
 HookManager *HookManager::s_Instance = nullptr;
 
 
-HookManager::HookManager(const Parameters &params, HMODULE module)
+HookManager::HookManager(const USVFSParameters &params, HMODULE module)
   : m_Context(params, module)
 {
   if (s_Instance != nullptr) {
@@ -98,9 +99,14 @@ void HookManager::removeHook(const std::string &functionName)
 {
   auto iter = m_Hooks.find(functionName);
   if (iter != m_Hooks.end()) {
-    RemoveHook(iter->second);
-    m_Hooks.erase(iter);
-    spdlog::get("usvfs")->info("removed hook for {}", functionName);
+    try {
+      RemoveHook(iter->second);
+      m_Hooks.erase(iter);
+      spdlog::get("usvfs")->info("removed hook for {}", functionName);
+    } catch (const std::exception &e) {
+      spdlog::get("usvfs")->critical("failed to remove hook of {}: {}",
+                                     functionName, e.what());
+    }
   } else {
     spdlog::get("usvfs")->info("{} wasn't hooked", functionName);
   }
@@ -109,9 +115,9 @@ void HookManager::removeHook(const std::string &functionName)
 void HookManager::logStubInt(LPVOID address)
 {
   if (m_Stubs.find(address) != m_Stubs.end()) {
-    spdlog::get("hooks")->debug("{0} called", m_Stubs[address]);
+    spdlog::get("hooks")->warn("{0} called", m_Stubs[address]);
   } else {
-    spdlog::get("hooks")->debug("unknown function at {0} called", address);
+    spdlog::get("hooks")->warn("unknown function at {0} called", address);
   }
 }
 
@@ -154,10 +160,10 @@ void HookManager::installHook(HMODULE module1, HMODULE module2, const std::strin
   } else {
     m_Stubs.insert(make_pair(funcAddr, functionName));
     m_Hooks.insert(make_pair(std::string(functionName), handle));
-    spdlog::get("usvfs")->info("hooked {0} in {1} type {2}",
-      functionName, winapi::ansi::getModuleFileName(usedModule), GetHookType(handle));
+    spdlog::get("usvfs")->info(
+        "hooked {0} ({1}) in {2} type {3}", functionName, funcAddr,
+        winapi::ansi::getModuleFileName(usedModule), GetHookType(handle));
   }
-
 }
 
 void HookManager::installStub(HMODULE module1, HMODULE module2, const std::string &functionName)
@@ -171,6 +177,10 @@ void HookManager::installStub(HMODULE module1, HMODULE module2, const std::strin
     funcAddr = MyGetProcAddress(module1, functionName.c_str());
     if (funcAddr != nullptr) {
       handle = InstallStub(funcAddr, logStub, &err);
+    } else {
+      spdlog::get("usvfs")->debug("{} doesn't contain {}",
+                                  winapi::ansi::getModuleFileName(module1),
+                                  functionName);
     }
     if (handle != INVALID_HOOK) usedModule = module1;
   }
@@ -179,6 +189,10 @@ void HookManager::installStub(HMODULE module1, HMODULE module2, const std::strin
     funcAddr = MyGetProcAddress(module2, functionName.c_str());
     if (funcAddr != nullptr) {
       handle = InstallStub(funcAddr, logStub, &err);
+    } else {
+      spdlog::get("usvfs")->debug("{} doesn't contain {}",
+                                  winapi::ansi::getModuleFileName(module2),
+                                  functionName);
     }
     if (handle != INVALID_HOOK) usedModule = module2;
   }
@@ -188,70 +202,66 @@ void HookManager::installStub(HMODULE module1, HMODULE module2, const std::strin
   } else {
     m_Stubs.insert(make_pair(funcAddr, functionName));
     m_Hooks.insert(make_pair(std::string(functionName), handle));
-    spdlog::get("usvfs")->info("stubbed {0} in {1} type {2}",
-      functionName, winapi::ansi::getModuleFileName(usedModule), GetHookType(handle));
+    spdlog::get("usvfs")->info(
+        "stubbed {0} ({1}) in {2} type {3}", functionName, funcAddr,
+        winapi::ansi::getModuleFileName(usedModule), GetHookType(handle));
   }
 }
 
+
 void HookManager::initHooks()
 {
+  HookLib::TrampolinePool::instance().setBlock(true);
+
   HMODULE k32Mod = GetModuleHandleA("kernel32.dll");
-  spdlog::get("usvfs")->debug("kernel32.dll at {0:x}", reinterpret_cast<unsigned long>(k32Mod));
+  spdlog::get("usvfs")->debug("kernel32.dll at {0:x}", reinterpret_cast<uintptr_t>(k32Mod));
   // kernelbase.dll contains the actual implementation for functions formerly in
   // kernel32.dll and advapi32.dll, starting with Windows 7
   // http://msdn.microsoft.com/en-us/library/windows/desktop/dd371752(v=vs.85).aspx
   HMODULE kbaseMod = GetModuleHandleA("kernelbase.dll");
-  spdlog::get("usvfs")->debug("kernelbase.dll at {0:x}", reinterpret_cast<unsigned long>(kbaseMod));
+  spdlog::get("usvfs")->debug("kernelbase.dll at {0:x}", reinterpret_cast<uintptr_t>(kbaseMod));
 
   installHook(kbaseMod, k32Mod, "GetFileAttributesExW", uhooks::GetFileAttributesExW);
-//  installHook(kbaseMod, k32Mod, "GetFileAttributesW", uhooks::GetFileAttributesW);
+  installHook(kbaseMod, k32Mod, "GetFileAttributesW", uhooks::GetFileAttributesW);
+  //installStub(kbaseMod, k32Mod, "GetFileAttributesExA");
+  //installStub(kbaseMod, k32Mod, "GetFileAttributesA");
   installHook(kbaseMod, k32Mod, "SetFileAttributesW", uhooks::SetFileAttributesW);
   installHook(kbaseMod, k32Mod, "CreateFileW", uhooks::CreateFileW); // not all calls seem to translate to a call to NtCreateFile
-  installStub(kbaseMod, k32Mod, "CreateFileExW");
-//  installStub(kbaseMod, k32Mod, "CreateDirectoryW");
-  installStub(kbaseMod, k32Mod, "DeleteFileW");
-  installStub(kbaseMod, k32Mod, "DeleteFileA");
+  installHook(kbaseMod, k32Mod, "CreateFileA", uhooks::CreateFileA);
+  installHook(kbaseMod, k32Mod, "CreateDirectoryW", uhooks::CreateDirectoryW);
+  installHook(kbaseMod, k32Mod, "DeleteFileW", uhooks::DeleteFileW);
+  installHook(kbaseMod, k32Mod, "DeleteFileA", uhooks::DeleteFileA);
+  installHook(kbaseMod, k32Mod, "GetCurrentDirectoryA", uhooks::GetCurrentDirectoryA);
   installHook(kbaseMod, k32Mod, "GetCurrentDirectoryW", uhooks::GetCurrentDirectoryW);
+  installHook(kbaseMod, k32Mod, "SetCurrentDirectoryA", uhooks::SetCurrentDirectoryA);
   installHook(kbaseMod, k32Mod, "SetCurrentDirectoryW", uhooks::SetCurrentDirectoryW);
 
-  //installHook(kbaseMod, k32Mod, "ExitProcess", uhooks::ExitProcess);
+  installHook(kbaseMod, k32Mod, "ExitProcess", uhooks::ExitProcess);
 
   installHook(kbaseMod, k32Mod, "CreateProcessA", uhooks::CreateProcessA);
   installHook(kbaseMod, k32Mod, "CreateProcessW", uhooks::CreateProcessW);
-  installStub(kbaseMod, k32Mod, "CreateJobObjectA");
-  installStub(kbaseMod, k32Mod, "CreateJobObjectW");
 
-  installStub(kbaseMod, k32Mod, "MoveFileA");
-  installStub(kbaseMod, k32Mod, "MoveFileExA");
-  installStub(kbaseMod, k32Mod, "MoveFileW");
-  installStub(kbaseMod, k32Mod, "MoveFileExW");
-/*
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileStringA");
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileStringW");
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileStructA");
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileStructW");
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileSectionNamesA");
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileSectionNamesW");
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileSectionA");
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileSectionW");
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileIntA");
-  installStub(kbaseMod, k32Mod, "GetPrivateProfileIntW");
+  installHook(kbaseMod, k32Mod, "MoveFileA", uhooks::MoveFileA);
+  installHook(kbaseMod, k32Mod, "MoveFileW", uhooks::MoveFileW);
+  installHook(kbaseMod, k32Mod, "MoveFileExA", uhooks::MoveFileExA);
+  installHook(kbaseMod, k32Mod, "MoveFileExW", uhooks::MoveFileExW);
 
-  installStub(kbaseMod, k32Mod, "WritePrivateProfileSectionA");
-  installStub(kbaseMod, k32Mod, "WritePrivateProfileSectionW");
-  installStub(kbaseMod, k32Mod, "WritePrivateProfileStringA");
-  installStub(kbaseMod, k32Mod, "WritePrivateProfileStringW");
-  installStub(kbaseMod, k32Mod, "WritePrivateProfileStructA");
-  installStub(kbaseMod, k32Mod, "WritePrivateProfileStructW");
-*/
-  installStub(kbaseMod, k32Mod, "CopyFileA");
-  installStub(kbaseMod, k32Mod, "CopyFileW");
+  installHook(kbaseMod, k32Mod, "CopyFileA", uhooks::CopyFileA);
+  installHook(kbaseMod, k32Mod, "CopyFileW", uhooks::CopyFileW);
+  installHook(kbaseMod, k32Mod, "CopyFileExA", uhooks::CopyFileExA);
+  installHook(kbaseMod, k32Mod, "CopyFileExW", uhooks::CopyFileExW);
+
   installStub(kbaseMod, k32Mod, "CreateHardLinkA");
   installStub(kbaseMod, k32Mod, "CreateHardLinkW");
   installHook(kbaseMod, k32Mod, "GetFullPathNameW", uhooks::GetFullPathNameW);
 
+  installHook(kbaseMod, k32Mod, "GetFileVersionInfoW", uhooks::GetFileVersionInfoW);
+  installHook(kbaseMod, k32Mod, "GetFileVersionInfoExW", uhooks::GetFileVersionInfoExW);
+  installHook(kbaseMod, k32Mod, "GetFileVersionInfoSizeW", uhooks::GetFileVersionInfoSizeW);
+  installHook(kbaseMod, k32Mod, "GetFileVersionInfoSizeExW", uhooks::GetFileVersionInfoSizeExW);
+
   HMODULE ntdllMod = GetModuleHandleA("ntdll.dll");
-  spdlog::get("usvfs")->debug("ntdll.dll at {0:x}", reinterpret_cast<unsigned long>(ntdllMod));
+  spdlog::get("usvfs")->debug("ntdll.dll at {0:x}", reinterpret_cast<uintptr_t>(ntdllMod));
   installHook(ntdllMod, nullptr, "NtQueryFullAttributesFile", uhooks::NtQueryFullAttributesFile);
   installHook(ntdllMod, nullptr, "NtQueryAttributesFile", uhooks::NtQueryAttributesFile);
   installHook(ntdllMod, nullptr, "NtQueryDirectoryFile", uhooks::NtQueryDirectoryFile);
@@ -262,7 +272,7 @@ void HookManager::initHooks()
 
   HMODULE shellMod = GetModuleHandleA("shell32.dll");
   if (shellMod != nullptr) {
-    spdlog::get("usvfs")->debug("shell32.dll at {0:x}", reinterpret_cast<unsigned long>(shellMod));
+    spdlog::get("usvfs")->debug("shell32.dll at {0:x}", reinterpret_cast<uintptr_t>(shellMod));
     installStub(shellMod, nullptr, "SHFileOperationA");
     installStub(shellMod, nullptr, "SHFileOperationW");
     installStub(shellMod, nullptr, "ShellExecuteA");
@@ -271,12 +281,6 @@ void HookManager::initHooks()
     installStub(shellMod, nullptr, "ShellExecuteExW");
   }
 
-  HMODULE versionMod = GetModuleHandleA("version.dll");
-  if (versionMod != nullptr) {
-    spdlog::get("usvfs")->debug("version.dll at {0:x}", reinterpret_cast<unsigned long>(versionMod));
-    installStub(versionMod, nullptr, "GetFileVersionInfoW");
-    installStub(versionMod, nullptr, "GetFileVersionInfoSizeW");
-  }
 
 /*  HMODULE oleMod = GetModuleHandleA("ole32.dll");
   if (oleMod != nullptr) {
@@ -285,15 +289,23 @@ void HookManager::initHooks()
     installHook(oleMod, nullptr, "CoCreateInstanceEx", uhooks::CoCreateInstanceEx);
   }
 */
+
   installHook(kbaseMod, k32Mod, "LoadLibraryExW", uhooks::LoadLibraryExW);
   installHook(kbaseMod, k32Mod, "LoadLibraryExA", uhooks::LoadLibraryExA);
   installHook(kbaseMod, k32Mod, "LoadLibraryW", uhooks::LoadLibraryW);
   installHook(kbaseMod, k32Mod, "LoadLibraryA", uhooks::LoadLibraryA);
 
   // install this hook late as usvfs is calling it itself for debugging purposes
-//  installHook(k32Mod, kbaseMod, "GetModuleFileNameW", uhooks::GetModuleFileNameW);
-
+  installHook(k32Mod, kbaseMod, "GetModuleFileNameW", uhooks::GetModuleFileNameW);
+  installHook(k32Mod, kbaseMod, "GetModuleFileNameA", uhooks::GetModuleFileNameA);
+/*
+  installHook(kbaseMod, k32Mod, "GetModuleHandleW", uhooks::GetModuleHandleW);
+  installHook(kbaseMod, k32Mod, "GetModuleHandleA", uhooks::GetModuleHandleA);
+  installHook(kbaseMod, k32Mod, "GetModuleHandleExW", uhooks::GetModuleHandleExW);
+  installHook(kbaseMod, k32Mod, "GetModuleHandleExA", uhooks::GetModuleHandleExA);
+*/
   spdlog::get("usvfs")->debug("hooks installed");
+  HookLib::TrampolinePool::instance().setBlock(false);
 }
 
 
@@ -301,8 +313,14 @@ void HookManager::removeHooks()
 {
   while (m_Hooks.size() > 0) {
     auto iter = m_Hooks.begin();
-    spdlog::get("usvfs")->debug("remove hook {}", iter->first);
-    RemoveHook(iter->second);
+    try {
+      RemoveHook(iter->second);
+      spdlog::get("usvfs")->debug("removed hook {}", iter->first);
+    } catch (const std::exception &e) {
+      spdlog::get("usvfs")->critical("failed to remove hook: {}", e.what());
+    }
+
+    // remove either way, otherwise this is an endless loop
     m_Hooks.erase(iter);
   }
 }

@@ -23,7 +23,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "stringutils.h"
 #include "stringcast.h"
 #include "logging.h"
-#include <format.h>
+#include <fmt/format.h>
 #include <spdlog.h>
 
 
@@ -31,8 +31,10 @@ namespace ush = usvfs::shared;
 
 namespace usvfs {
 
-UnicodeString::UnicodeString() {
+UnicodeString::UnicodeString()
+{
   m_Data.Length = m_Data.MaximumLength = 0;
+  m_Data.Buffer = nullptr;
 }
 
 
@@ -112,16 +114,22 @@ void UnicodeString::setFromHandle(HANDLE fileHandle)
     spdlog::get("hooks")->info("success: {}", ush::string_cast<std::string>((WCHAR*)info->FileName));
   }
 */
-  wchar_t dummy[2];
+
+  if (m_Buffer.size() < 128) {
+    m_Buffer.resize(128);
+  }
 
   SetLastError(0UL);
-  DWORD res = GetFinalPathNameByHandleW(fileHandle, dummy, 1, FILE_NAME_NORMALIZED);
-  if (res != 0) {
+  DWORD res = GetFinalPathNameByHandleW(fileHandle, &m_Buffer[0],
+                                        static_cast<DWORD>(m_Buffer.size()),
+                                        FILE_NAME_NORMALIZED);
+  if (res == 0) {
+    m_Buffer.resize(0);
+  } else if (res > m_Buffer.size()) {
     m_Buffer.resize(res);
     GetFinalPathNameByHandleW(fileHandle, &m_Buffer[0], res, FILE_NAME_NORMALIZED);
-  } else {
-    m_Buffer.resize(0);
   }
+
   update();
 
   /* This code would also work on Windows XP but requires access to non-public API
